@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+get_tmux_option() {
+	local option="$1"
+	local default_value="$2"
+	local option_value
+	option_value=$(tmux show-option -gqv "$option" 2>/dev/null || echo "")
+	if [[ -z "$option_value" ]]; then
+		echo "$default_value"
+	else
+		echo "$option_value"
+	fi
+}
+
+MXSH_PATH=$(get_tmux_option "@mxsh-path" "$HOME")
+MXSH_KEY=$(get_tmux_option "@mxsh-key" "s")
+MXSH_HEIGHT=$(get_tmux_option "@mxsh-height" "40")
+MXSH_WIDTH=$(get_tmux_option "@mxsh-width" "60")
+
+if [[ ! -d "$MXSH_PATH" ]]; then
+	echo "Error: Directory $MXSH_PATH does not exist" >&2
+	exit 1
+fi
+
+get_existing_sessions() {
+	local current_session
+	current_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
+
+	if [[ -z "$current_session" ]]; then
+		tmux list-sessions -F '#{session_name}' 2>/dev/null | sort
+	else
+		tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v "^${current_session}$" | sort
+	fi
+}
+
+get_available_directories() {
+	find "$MXSH_PATH" -maxdepth 1 -mindepth 1 -type d -printf "%f\n" 2>/dev/null | sort
+}
+
+build_selection_list() {
+	local existing_sessions
+	local all_directories
+
+	existing_sessions=$(get_existing_sessions)
+	all_directories=$(get_available_directories)
+
+	if [[ -n "$existing_sessions" ]]; then
+		echo "$existing_sessions" | while read -r session; do
+			echo "* $session"
+		done
+	fi
+
+	if [[ -n "$all_directories" ]]; then
+		echo "$all_directories" | while read -r dir; do
+			if ! echo "$existing_sessions" | grep -qx "$dir"; then
+				echo "$dir"
+			fi
+		done
+	fi
+}
+
+main() {
+	local selection_list
+	selection_list=$(build_selection_list)
+
+	if [[ -z "$selection_list" ]]; then
+		tmux display-message "No directories found in $MXSH_PATH"
+		exit 0
+	fi
+
+	local selected
+	selected=$(echo "$selection_list" | fzf \
+		--reverse \
+		--prompt "mxsh> " \
+		--header "Select a project (existing sessions marked with *, sorted by last visited)" \
+		--preview "ls -la '$MXSH_PATH/{}' 2>/dev/null | head -20" \
+		--preview-window=right:50%:wrap)
+
+	if [[ -z "$selected" ]]; then
+		exit 0
+	fi
+
+	local original_session_name="$selected"
+	if [[ "$original_session_name" == "* "* ]]; then
+		original_session_name="${original_session_name:2}"
+	fi
+
+	local target_path="$MXSH_PATH/$original_session_name"
+
+	# Session exists? switch to it. it doesn't? create it
+	if tmux has-session -t="$original_session_name" 2>/dev/null; then
+		if [[ -n "${TMUX:-}" ]]; then
+			if ! tmux switch-client -t "$original_session_name" 2>/dev/null; then
+				tmux display-message "Failed to switch to session $original_session_name"
+			fi
+		else
+			if ! tmux attach -t "$original_session_name" 2>/dev/null; then
+				tmux display-message "Failed to attach to session $original_session_name"
+			fi
+		fi
+	else
+		if ! tmux new-session -d -s "$original_session_name" -c "$target_path" 2>/dev/null; then
+			tmux display-message "Failed to create session $original_session_name"
+			exit 1
+		fi
+		if [[ -n "${TMUX:-}" ]]; then
+			if ! tmux switch-client -t "$original_session_name" 2>/dev/null; then
+				tmux display-message "Failed to switch to new session"
+			fi
+		else
+			if ! tmux attach -t "$original_session_name" 2>/dev/null; then
+				tmux display-message "Failed to attach to new session"
+			fi
+		fi
+	fi
+}
+
+main "$@"
