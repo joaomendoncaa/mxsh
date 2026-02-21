@@ -18,7 +18,7 @@ set_default_options() {
 	local path_option
 	path_option=$(get_tmux_option "@mxsh-path" "")
 	if [[ -z "$path_option" ]]; then
-		tmux set-option -g @mxsh-path "$HOME/lab"
+		tmux set-option -g @mxsh-path "$HOME/*"
 	fi
 
 	local key_option
