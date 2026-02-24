@@ -30,13 +30,13 @@ set_default_options() {
 	local height_option
 	height_option=$(get_tmux_option "@mxsh-height" "")
 	if [[ -z "$height_option" ]]; then
-		tmux set-option -g @mxsh-height "40"
+		tmux set-option -g @mxsh-height "100"
 	fi
 
 	local width_option
 	width_option=$(get_tmux_option "@mxsh-width" "")
 	if [[ -z "$width_option" ]]; then
-		tmux set-option -g @mxsh-width "60"
+		tmux set-option -g @mxsh-width "100"
 	fi
 }
 
@@ -44,9 +44,9 @@ setup_key_binding() {
 	local key
 	key=$(get_tmux_option "@mxsh-key" "s")
 	local height
-	height=$(get_tmux_option "@mxsh-height" "40")
+	height=$(get_tmux_option "@mxsh-height" "100")
 	local width
-	width=$(get_tmux_option "@mxsh-width" "60")
+	width=$(get_tmux_option "@mxsh-width" "100")
 
 	tmux bind "$key" display-popup -w "${width}%" -h "${height}%" -E "$CURRENT_DIR/bin/picker"
 }

@@ -20,8 +20,6 @@ get_tmux_option() {
 # Example: "~/lab/*:~/.config.jmmm.sh:~/downloads/*"
 MXSH_PATH=$(get_tmux_option "@mxsh-path" "$HOME/*")
 MXSH_KEY=$(get_tmux_option "@mxsh-key" "s")
-MXSH_HEIGHT=$(get_tmux_option "@mxsh-height" "40")
-MXSH_WIDTH=$(get_tmux_option "@mxsh-width" "60")
 
 sanitize_session_name() {
 	local name="$1"
