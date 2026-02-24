@@ -139,8 +139,6 @@ main() {
 		--reverse \
 		--prompt "mxsh> " \
 		--header "Select a project (existing sessions marked with *)" \
-		--preview "ls -la {2} 2>/dev/null | head -20" \
-		--preview-window=right:50%:wrap \
 		--delimiter='\t' \
 		--with-nth=1)
 
