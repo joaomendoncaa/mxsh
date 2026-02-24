@@ -135,10 +135,14 @@ main() {
 	local selected
 	selected=$(echo "$selection_list" | fzf \
 		--border=none \
-		--reverse \
-		--prompt "mxsh> " \
-		--header "Select a project (existing sessions marked with *)" \
+		--layout=default \
+		--gutter=" " \
+		--prompt "> " \
 		--delimiter='\t' \
+		--info=hidden \
+		--separator=' ' \
+		--pointer=' ' \
+		--no-color \
 		--with-nth=1)
 
 	if [[ -z "$selected" ]]; then
