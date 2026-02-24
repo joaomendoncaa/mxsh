@@ -48,7 +48,7 @@ setup_key_binding() {
 	local width
 	width=$(get_tmux_option "@mxsh-width" "100")
 
-	tmux bind "$key" display-popup -w "${width}%" -h "${height}%" -E "$CURRENT_DIR/bin/picker"
+	tmux bind "$key" display-popup -w "${width}%" -h "${height}%" -b none -E "$CURRENT_DIR/bin/picker"
 }
 
 main() {

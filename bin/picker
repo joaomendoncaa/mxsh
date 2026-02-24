@@ -134,6 +134,7 @@ main() {
 
 	local selected
 	selected=$(echo "$selection_list" | fzf \
+		--border=none \
 		--reverse \
 		--prompt "mxsh> " \
 		--header "Select a project (existing sessions marked with *)" \
