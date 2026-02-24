@@ -77,11 +77,14 @@ get_existing_sessions() {
 	local current_session
 	current_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
 
+	local sessions
 	if [[ -z "$current_session" ]]; then
-		tmux list-sessions -F '#{session_name}' 2>/dev/null | sort
+		sessions=$(tmux list-sessions -F '#{session_activity}:#{session_name}' 2>/dev/null)
 	else
-		tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -v "^${current_session}$" | sort
+		sessions=$(tmux list-sessions -F '#{session_activity}:#{session_name}' 2>/dev/null | grep -v ":${current_session}$")
 	fi
+
+	echo "$sessions" | sort -t':' -k1 -rn | sed 's/^[^:]*://'
 }
 
 get_available_directories() {
