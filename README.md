@@ -4,6 +4,7 @@
 
 ## Features
 
-- Fuzzy find sessions and selected directories
-- Git stats per session
-- Opencode sessions per session
+- Fuzzy find sessions in selected directories
+- Show git stats for each session
+- Descriminate between worktrees
+- Show opencode sessions
