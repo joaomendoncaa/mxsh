@@ -104,13 +104,13 @@ get_available_directories() {
 }
 
 get_git_stats() {
-	xargs -P 0 -I {} bash -c '
+	xargs -P 12 -I {} bash -c '
 		dir="$1"
 		[ -d "$dir/.git" ] || exit 0
-		untracked_count=$(git -C "$dir" ls-files --others --exclude-standard -z 2>/dev/null | xargs -0 -r -I FILE bash -c "[ -f \"$dir/FILE\" ] && wc -l < \"$dir/FILE\"" 2>/dev/null | awk "{s+=\$1}END{print s+0}")
 		tracked=$(timeout 2 git -C "$dir" diff --numstat HEAD 2>/dev/null)
-		[ -z "$tracked" ] && [ "$untracked_count" -eq 0 ] && exit 0
-		result=$(echo "$tracked" | awk -v u="$untracked_count" "{a+=\$1+0;d+=\$2+0}END{print a+u\" \"d}")
+		untracked=$(git -C "$dir" ls-files --others --exclude-standard -z 2>/dev/null | xargs -0 -r wc -l 2>/dev/null | tail -1 | awk "{print \$1+0}")
+		[ -z "$tracked" ] && [ "${untracked:-0}" -eq 0 ] && exit 0
+		result=$(echo "$tracked" | awk -v u="${untracked:-0}" "{a+=\$1+0;d+=\$2+0}END{print a+u\" \"d}")
 		additions="${result%% *}"
 		deletions="${result##* }"
 		[ "$additions" -eq 0 ] && [ "$deletions" -eq 0 ] && exit 0
@@ -137,28 +137,22 @@ build_selection_list() {
 		fi
 	fi
 
-	# Collect all paths and run parallel git stats
-	local all_paths=""
+	# Git stats only for active sessions (batched via single tmux call)
+	local session_paths stats_output
 	if [[ -n "$existing_sessions" ]]; then
-		while IFS= read -r s; do
-			local p
-			p=$(tmux display-message -t "$s" -p '#{session_path}' 2>/dev/null || echo "")
-			[[ -n "$p" ]] && all_paths+="$p"$'\n'
-		done <<<"$existing_sessions"
+		session_paths=$(tmux list-sessions -F '#{session_name}:#{session_path}' 2>/dev/null | grep -v "^${current_session}:")
+		local session_dirs=""
+		while IFS=: read -r _ sname spath; do
+			[[ -n "$spath" ]] && session_dirs+="$spath"$'\n'
+		done < <(tmux list-sessions -F '#{session_activity}:#{session_name}:#{session_path}' 2>/dev/null | grep -v ":${current_session}:")
+		[[ -n "$session_dirs" ]] && stats_output=$(printf '%s' "$session_dirs" | sort -u | get_git_stats)
 	fi
-	if [[ -n "$all_directories" ]]; then
-		while IFS='|' read -r _ dirpath; do
-			all_paths+="$dirpath"$'\n'
-		done <<<"$all_directories"
-	fi
-	local stats_output
-	[[ -n "$all_paths" ]] && stats_output=$(printf '%s' "$all_paths" | sort -u | get_git_stats)
 
 	# Build selection list
 	if [[ -n "$existing_sessions" ]]; then
 		echo "$existing_sessions" | while read -r session; do
 			local session_path stats=""
-			session_path=$(tmux display-message -t "$session" -p '#{session_path}' 2>/dev/null || echo "")
+			session_path=$(echo "$session_paths" | grep "^${session}:" | cut -d: -f2-)
 			[[ -n "$session_path" && -n "$stats_output" ]] && stats=$(echo "$stats_output" | grep "^${session_path}	" | cut -f2)
 			[[ -n "$stats" ]] && stats=" $stats"
 			printf '* %s%s\t\n' "$session" "$stats"
@@ -169,10 +163,7 @@ build_selection_list() {
 		while IFS='|' read -r dirname dirpath; do
 			[[ -z "$dirname" ]] && continue
 			if ! echo "$combined_sessions" | grep -qx "$dirname"; then
-				local stats=""
-				[[ -n "$stats_output" ]] && stats=$(echo "$stats_output" | grep "^${dirpath}	" | cut -f2)
-				[[ -n "$stats" ]] && stats=" $stats"
-				printf '%s%s\t%s\n' "$dirname" "$stats" "$dirpath"
+				printf '%s\t%s\n' "$dirname" "$dirpath"
 			fi
 		done <<<"$all_directories"
 	fi
@@ -212,10 +203,6 @@ main() {
 	if [[ "$original_session_name" == "* "* ]]; then
 		original_session_name="${original_session_name:2}"
 		original_session_name=$(echo "$original_session_name" | sed 's/ +[0-9].*//')
-	fi
-
-	if [[ -z "$target_path" ]]; then
-		target_path=""
 	fi
 
 	local session_name
