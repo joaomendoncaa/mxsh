@@ -17,7 +17,8 @@ pub enum Command {
     Kill,
     Help,
     Config,
-    SelfDestruct,
+    Purge { with_config: bool },
+    SelfDestruct { with_config: bool },
     Unknown(String),
 }
 
@@ -52,11 +53,37 @@ impl Cli {
                     };
                 }
                 "kill" => command = Command::Kill,
-                "self-destruct" => command = Command::SelfDestruct,
+                "purge" => command = Command::Purge { with_config: false },
+                "self-destruct" => command = Command::SelfDestruct { with_config: true },
                 "config" => command = Command::Config,
                 a if a.starts_with("--") => {
                     let rest = &a[2..];
-                    if let Some((key, value)) = rest.split_once('=') {
+                    let is_purge = matches!(
+                        command,
+                        Command::Purge { .. } | Command::SelfDestruct { .. }
+                    );
+                    if rest == "with-config" || rest.starts_with("with-config=") {
+                        match &mut command {
+                            Command::Purge { with_config } => {
+                                *with_config = true;
+                            }
+                            Command::SelfDestruct { with_config } => {
+                                *with_config = true;
+                            }
+                            _ => {
+                                // not in purge context -> treat as normal flag override
+                                // (will surface as "isn't a valid flag" later)
+                                if let Some((key, value)) = rest.split_once('=') {
+                                    overrides.push((key.to_string(), Some(value.to_string())));
+                                } else {
+                                    overrides.push((rest.to_string(), None));
+                                }
+                            }
+                        }
+                    } else if is_purge {
+                        // unknown flag for purge
+                        command = Command::Unknown(unknown_cmd(&args));
+                    } else if let Some((key, value)) = rest.split_once('=') {
                         overrides.push((key.to_string(), Some(value.to_string())));
                     } else {
                         overrides.push((rest.to_string(), None));
@@ -93,11 +120,12 @@ ramo daemon logs    Tail daemon logs\n\
 ramo daemon install     Install systemd user service (daemon starts at login)\n\
 ramo daemon uninstall   Remove the systemd user service\n\
 \n\
+ramo purge                Remove daemon service and state (keeps config)\n\
+ramo purge --with-config  Remove daemon service, state and config\n\
+\n\
 ramo kill           Alias for daemon kill\n\
 \n\
 ramo config         Print config path and contents\n\
-\n\
-ramo self-destruct  Remove ramo from your system (daemon, data, binary)\n\
 \n\
 ramo help           Print this help\n\
 \n\

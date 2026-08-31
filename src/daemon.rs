@@ -59,8 +59,6 @@ const CACHE_SAVE_DEBOUNCE: Duration = Duration::from_secs(10);
 #[derive(Serialize, Deserialize, Default)]
 struct PersistedCache {
     git: crate::git::DiskCache,
-    entries: Vec<Entry>,
-    entries_found: usize,
 }
 
 fn cache_path() -> PathBuf {
@@ -72,11 +70,9 @@ fn load_persisted_cache() -> Option<PersistedCache> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save_persisted_cache(builder: &TreeBuilder, payload: &Payload) {
+fn save_persisted_cache(builder: &TreeBuilder) {
     let cache = PersistedCache {
         git: builder.to_disk_cache(),
-        entries: payload.entries.clone(),
-        entries_found: payload.entries_found,
     };
     let path = cache_path();
     let Some(dir) = path.parent() else {
@@ -289,18 +285,19 @@ pub fn start(overrides: Vec<(String, Option<String>)>) -> std::io::Result<()> {
         config_lock.read().unwrap().daemon_timeout
     );
 
-    // Serve the last-known state instantly; git caches are warmed from disk,
-    // then a background build reconciles with reality.
-    let mut initial_entries = Vec::new();
-    let mut initial_count = 0usize;
+    // Start with empty entries — empty is preferable to stale. The first
+    // client sees the loader until the first fresh build completes, then
+    // the refresh thread broadcasts. Git caches are warmed from disk so
+    // that first build is fast (entries themselves are never persisted).
+    let initial_entries: Vec<Entry> = Vec::new();
+    let initial_count = 0usize;
     if let Some(cache) = load_persisted_cache() {
         builder.load_disk_cache(&cache.git);
-        initial_entries = cache.entries;
-        initial_count = cache.entries_found;
         info!(
-            "disk cache loaded ({} entries, {} diffs)",
-            initial_entries.len(),
-            cache.git.diffs.len()
+            "disk cache loaded ({} diffs, {} branches, {} worktrees)",
+            cache.git.diffs.len(),
+            cache.git.branches.len(),
+            cache.git.worktrees.len(),
         );
     } else {
         info!("no disk cache, cold start");
@@ -419,11 +416,8 @@ pub fn start(overrides: Vec<(String, Option<String>)>) -> std::io::Result<()> {
                 };
                 if changed {
                     broadcast(&data, &clients);
-                    if let Ok(bytes) = data.read().map(|d| d.clone())
-                        && let Ok(payload) = serde_json::from_slice::<Payload>(&bytes)
-                        && last_cache_save.elapsed() > CACHE_SAVE_DEBOUNCE
-                    {
-                        save_persisted_cache(&builder, &payload);
+                    if last_cache_save.elapsed() > CACHE_SAVE_DEBOUNCE {
+                        save_persisted_cache(&builder);
                         last_cache_save = Instant::now();
                     }
                 }
@@ -499,7 +493,7 @@ pub fn start(overrides: Vec<(String, Option<String>)>) -> std::io::Result<()> {
                     && clients.lock().unwrap().is_empty()
                 {
                     info!("idle timeout reached, shutting down daemon");
-                    save_disk_cache_sync(&builder, &data);
+                    save_persisted_cache(&builder);
                     break;
                 }
                 thread::sleep(ACCEPT_POLL);
@@ -516,14 +510,6 @@ pub fn start(overrides: Vec<(String, Option<String>)>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     Ok(())
-}
-
-fn save_disk_cache_sync(builder: &TreeBuilder, data: &PayloadBytes) {
-    if let Ok(bytes) = data.read().map(|d| d.clone())
-        && let Ok(payload) = serde_json::from_slice::<Payload>(&bytes)
-    {
-        save_persisted_cache(builder, &payload);
-    }
 }
 
 fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> std::io::Result<()> {

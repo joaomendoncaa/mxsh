@@ -241,6 +241,7 @@ impl Picker {
                 }
                 if let Some(idx) = self.get_index_from_mouse(event.column, event.row) {
                     self.cursor = idx;
+                    self.touched = true;
                     self.goto();
                 }
             }
@@ -265,6 +266,7 @@ impl Picker {
                 }
                 if let Some(idx) = self.get_index_from_mouse(event.column, event.row) {
                     self.cursor = idx;
+                    self.touched = true;
                     self.mouse_hover = true;
                 }
             }
@@ -364,6 +366,7 @@ impl Picker {
         if n == 0 {
             return;
         }
+        self.touched = true;
         // Scroll bookkeeping runs in virtual-row space, but the cursor keeps
         // stepping over entries only — gaps are never landed on.
         let max_row = self.rows().len().saturating_sub(1);
@@ -405,6 +408,7 @@ impl Picker {
         if len == 0 || amount == 0 {
             return;
         }
+        self.touched = true;
 
         if amount < 0 {
             let step = amount.unsigned_abs() as usize;

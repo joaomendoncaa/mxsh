@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const CACHE_TTL_MS: u128 = 5000;
+const CACHE_TTL_MS: u128 = 10_000;
 const WORKTREE_CACHE_TTL_MS: u128 = 30_000;
 
 #[derive(Default, Serialize, Deserialize)]

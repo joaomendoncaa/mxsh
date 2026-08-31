@@ -11,6 +11,7 @@ mod logs;
 mod model;
 mod opencode;
 mod picker;
+mod purge;
 mod renderer;
 mod selfdestruct;
 mod service;
@@ -54,8 +55,11 @@ fn main() -> io::Result<()> {
         Command::Daemon(Daemon::Uninstall) => {
             return service::uninstall();
         }
-        Command::SelfDestruct => {
-            return selfdestruct::run();
+        Command::Purge { with_config } => {
+            return purge::run(with_config);
+        }
+        Command::SelfDestruct { with_config } => {
+            return selfdestruct::run(with_config);
         }
         Command::Config => {
             daemon::print_config();

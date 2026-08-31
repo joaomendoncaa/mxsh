@@ -28,11 +28,14 @@ impl TreeBuilder {
     }
 
     pub fn build(&self, config: &Config) -> Vec<Entry> {
-        let snap = tmux::snapshot();
-        let sessions = snap.sessions;
-        let panes = snap.panes;
+        let (tmux_snapshot, oc_sessions) = std::thread::scope(|s| {
+            let tmux_h = s.spawn(tmux::snapshot);
+            let oc_h = s.spawn(opencode::list_sessions);
+            (tmux_h.join().unwrap(), oc_h.join().unwrap())
+        });
+        let sessions = tmux_snapshot.sessions;
+        let panes = tmux_snapshot.panes;
 
-        let oc_sessions = opencode::list_sessions();
         let oc_panes = tmux::opencode_panes(&panes);
         let pane_sessions = match_panes_to_sessions(&oc_panes, &oc_sessions);
 
@@ -48,17 +51,69 @@ impl TreeBuilder {
         let covered_paths: Vec<PathBuf> = dirs.iter().map(|d| d.path.clone()).collect();
         let covered_names: Vec<String> = dirs.iter().map(|d| d.name.clone()).collect();
 
-        let mut dir_entries: Vec<DirEntry> = Vec::with_capacity(dirs.len());
-        for (d, git) in dirs.iter().zip(git_data.iter()) {
-            let branch = self
-                .git_cache
-                .branch(&d.path)
-                .filter(|b| b != "master" && b != "main")
-                .filter(|_| {
-                    let active = open.contains(&d.path);
-                    !(active && config.hide_hints_branches_active || !active && config.hide_hints_branches_inactive)
+        let branches: Vec<Option<String>> = {
+            let n = dirs.len();
+            if n == 0 {
+                Vec::new()
+            } else if n == 1 {
+                vec![
+                    self.git_cache
+                        .branch(&dirs[0].path)
+                        .filter(|b| b != "master" && b != "main")
+                        .filter(|_| {
+                            let active = open.contains(&dirs[0].path);
+                            !(active && config.hide_hints_branches_active
+                                || !active && config.hide_hints_branches_inactive)
+                        }),
+                ]
+            } else {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4)
+                    .min(n)
+                    .min(8);
+                let chunk = n.div_ceil(threads);
+                let mut out: Vec<Option<Option<String>>> = (0..n).map(|_| None).collect();
+                std::thread::scope(|s| {
+                    for (chunk_idx, out_chunk) in out.chunks_mut(chunk).enumerate() {
+                        let start = chunk_idx * chunk;
+                        let dirs = &dirs;
+                        let open = &open;
+                        let config = config;
+                        let cache = &self.git_cache;
+                        s.spawn(move || {
+                            for (i, slot) in out_chunk.iter_mut().enumerate() {
+                                let idx = start + i;
+                                if idx >= dirs.len() {
+                                    break;
+                                }
+                                let b = cache
+                                    .branch(&dirs[idx].path)
+                                    .filter(|v| v != "master" && v != "main")
+                                    .filter(|_| {
+                                        let active = open.contains(&dirs[idx].path);
+                                        !(active && config.hide_hints_branches_active
+                                            || !active && config.hide_hints_branches_inactive)
+                                    });
+                                *slot = Some(b);
+                            }
+                        });
+                    }
                 });
-            dir_entries.push(build_dir_entry(d, git, branch, &sessions, &panes, &pane_sessions));
+                out.into_iter().map(|o| o.unwrap()).collect()
+            }
+        };
+
+        let mut dir_entries: Vec<DirEntry> = Vec::with_capacity(dirs.len());
+        for ((d, git), branch) in dirs.iter().zip(git_data.iter()).zip(branches) {
+            dir_entries.push(build_dir_entry(
+                d,
+                git,
+                branch,
+                &sessions,
+                &panes,
+                &pane_sessions,
+            ));
         }
         for s in tmux::list_external_sessions(&sessions, &covered_paths, &covered_names) {
             dir_entries.push(external_dir_entry(&s, &panes));
@@ -85,8 +140,12 @@ impl TreeBuilder {
     }
 
     fn git_phase(&self, dirs: &[DirInfo], open: &HashSet<PathBuf>, config: &Config) -> Vec<DirGit> {
-        let mut out = Vec::with_capacity(dirs.len());
-        for dir in dirs {
+        let n = dirs.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            let dir = &dirs[0];
             let worktrees = self.git_cache.worktrees(&dir.path);
             let worktree_diffs: HashMap<PathBuf, Changes> = worktrees
                 .iter()
@@ -98,9 +157,55 @@ impl TreeBuilder {
             } else {
                 self.git_cache.diff(&dir.path)
             };
-            out.push(DirGit { worktrees, worktree_diffs, main_diff });
+            return vec![DirGit {
+                worktrees,
+                worktree_diffs,
+                main_diff,
+            }];
         }
-        out
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(n)
+            .min(8);
+        let chunk = n.div_ceil(threads);
+        let mut out: Vec<Option<DirGit>> = (0..n).map(|_| None).collect();
+        std::thread::scope(|s| {
+            for (chunk_idx, out_chunk) in out.chunks_mut(chunk).enumerate() {
+                let start = chunk_idx * chunk;
+                let dirs = dirs;
+                let open = open;
+                let config = config;
+                let cache = &self.git_cache;
+                s.spawn(move || {
+                    for (i, slot) in out_chunk.iter_mut().enumerate() {
+                        let idx = start + i;
+                        if idx >= dirs.len() {
+                            break;
+                        }
+                        let dir = &dirs[idx];
+                        let worktrees = cache.worktrees(&dir.path);
+                        let worktree_diffs: HashMap<PathBuf, Changes> = worktrees
+                            .iter()
+                            .filter(|wt| !wt.is_main)
+                            .map(|wt| (wt.path.clone(), cache.diff(&wt.path)))
+                            .collect();
+                        let main_diff = if !open.contains(&dir.path) && config.hide_changes_inactive
+                        {
+                            Changes::default()
+                        } else {
+                            cache.diff(&dir.path)
+                        };
+                        *slot = Some(DirGit {
+                            worktrees,
+                            worktree_diffs,
+                            main_diff,
+                        });
+                    }
+                });
+            }
+        });
+        out.into_iter().map(|o| o.unwrap()).collect()
     }
 
     fn parse_directories(&self, path_config: &str) -> Vec<DirInfo> {
@@ -259,7 +364,11 @@ fn worktree_sessions(
 
 fn push_entry(entry: &DirEntry, is_last_dir: bool, rows: &mut Vec<Entry>) {
     let dir_idx = rows.len();
-    let search_text = entry.branch.as_ref().map(|b| format!("{} {b}", entry.name)).unwrap_or_else(|| entry.name.clone());
+    let search_text = entry
+        .branch
+        .as_ref()
+        .map(|b| format!("{} {b}", entry.name))
+        .unwrap_or_else(|| entry.name.clone());
     rows.push(finalize_entry(Entry {
         kind: EntryType::Dir,
         label: entry.name.clone(),
@@ -386,6 +495,7 @@ struct DirInfo {
     name: String,
     path: PathBuf,
 }
+
 struct DirEntry {
     name: String,
     path: PathBuf,
@@ -397,53 +507,19 @@ struct DirEntry {
     sessions: Vec<PaneSession>,
     worktree_sessions: Vec<Vec<PaneSession>>,
 }
+
 #[derive(Clone)]
 struct PaneSession {
     pane: TmuxPane,
     session: Opencode,
 }
 
-fn titles_match(p: &TmuxPane, s: &Opencode) -> bool {
-    let title = &s.title;
-    if title.len() < 10 {
-        return false;
-    }
-    let t = title.to_lowercase();
-    let pt = p
-        .pane_title
-        .to_lowercase()
-        .trim_start_matches("oc | ")
-        .trim_end_matches('…')
-        .trim_end_matches("...")
-        .trim()
-        .to_string();
-    let wn = p
-        .window_name
-        .to_lowercase()
-        .trim_start_matches(|c: char| !c.is_alphanumeric())
-        .trim_end_matches('…')
-        .trim_end_matches("...")
-        .trim()
-        .to_string();
-    let matched = (pt.len() >= 10 && t.contains(&pt)) || (wn.len() >= 10 && t.contains(&wn));
-    if !matched {
-        return false;
-    }
-    // Avoid flash: new window with stale old title. Require recency.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(s.time_updated);
-    let win_ms = p.window_activity * 1000;
-    if (now_ms - win_ms).abs() < 2000 && (now_ms - s.time_updated).abs() > 10000 {
-        return false;
-    }
-    true
-}
-
 fn synthetic(p: &TmuxPane) -> Opencode {
     Opencode {
-        id: format!("synthetic:{}:{}:{}", p.session_name, p.window_index, p.pane_index),
+        id: format!(
+            "synthetic:{}:{}:{}",
+            p.session_name, p.window_index, p.pane_index
+        ),
         title: "New session".into(),
         directory: p.current_path.clone(),
         time_updated: p.activity,
@@ -452,41 +528,21 @@ fn synthetic(p: &TmuxPane) -> Opencode {
 }
 
 fn match_panes_to_sessions(panes: &[&TmuxPane], sessions: &[Opencode]) -> Vec<PaneSession> {
+    // a pane is an opencode pane iff `tmux::opencode_panes`
+    // classified it by `pane_current_command` the correlation to
+    // opencode's api is done with the path and recency. pick the most
+    // recently updated session whose `directory` contains the pane's cwd.
+    // The session's own `title`/`is_running` are used verbatim
     let mut used = HashSet::new();
     let mut sorted = panes.to_vec();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.activity));
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(sorted.len());
     for p in &sorted {
-        if let Some(s) = sessions
-            .iter()
-            .filter(|s| !used.contains(&s.id) && titles_match(p, s))
-            .max_by_key(|s| s.time_updated)
-        {
-            used.insert(s.id.clone());
-            out.push(PaneSession {
-                pane: (*p).clone(),
-                session: s.clone(),
-            });
-        }
-    }
-    for p in &sorted {
-        if out.iter().any(|x| {
-            x.pane.session_name == p.session_name
-                && x.pane.window_index == p.window_index
-                && x.pane.pane_index == p.pane_index
-        }) {
-            continue;
-        }
-        if p.pane_title == "OpenCode" {
-            out.push(PaneSession {
-                pane: (*p).clone(),
-                session: synthetic(p),
-            });
-        } else if let Some(s) = sessions
+        let best = sessions
             .iter()
             .filter(|s| !used.contains(&s.id) && is_in(&p.current_path, &s.directory))
-            .max_by_key(|s| s.time_updated)
-        {
+            .max_by_key(|s| s.time_updated);
+        if let Some(s) = best {
             used.insert(s.id.clone());
             out.push(PaneSession {
                 pane: (*p).clone(),
@@ -501,9 +557,11 @@ fn match_panes_to_sessions(panes: &[&TmuxPane], sessions: &[Opencode]) -> Vec<Pa
     }
     out
 }
+
 fn is_in(path: &Path, base: &Path) -> bool {
     path == base || path.starts_with(base)
 }
+
 fn finalize_entry(mut entry: Entry) -> Entry {
     entry.compute_connector();
     entry.search_text_lower = entry.search_text.to_lowercase();

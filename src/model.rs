@@ -37,9 +37,6 @@ pub struct TmuxPane {
     pub current_command: String,
     pub current_path: PathBuf,
     pub activity: i64,
-    pub window_name: String,
-    pub pane_title: String,
-    pub window_activity: i64,
 }
 
 #[derive(Debug, Clone)]

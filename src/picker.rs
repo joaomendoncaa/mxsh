@@ -63,6 +63,7 @@ pub struct Picker {
     pub(crate) stashed_input: String,
     pub(crate) stashed_cursor: usize,
     pub(crate) help_edit: Option<HelpEdit>,
+    pub(crate) touched: bool,
 }
 
 impl Picker {
@@ -102,6 +103,7 @@ impl Picker {
             stashed_input: String::new(),
             stashed_cursor: 0,
             help_edit: None,
+            touched: false,
         };
         picker.filtered = picker.filtered();
         picker.cursor = picker.find_initial_cursor();
@@ -123,9 +125,13 @@ impl Picker {
 
         while let Ok(result) = self.rx.try_recv() {
             if let Some(payload) = result {
-                let is_empty = self.entries.is_empty();
                 let path_changed = self.config.path != payload.config.path
                     || self.config.path_worktrees != payload.config.path_worktrees;
+                let old_key = self
+                    .filtered
+                    .get(self.cursor)
+                    .and_then(|&i| self.entries.get(i))
+                    .map(|e| (e.kind.clone(), e.goto.clone()));
                 self.entries_found = payload.entries_found.max(payload.entries.len());
                 self.entries = payload.entries;
                 self.feedbacks = payload.feedbacks.clone();
@@ -142,8 +148,17 @@ impl Picker {
                 } else {
                     self.filtered = self.filtered();
                 }
-                if (is_empty && !self.filtered.is_empty()) || path_changed {
+                if path_changed
+                    || (self.input.is_empty() && !self.touched)
+                {
                     self.cursor = self.find_initial_cursor();
+                } else if let Some((kind, goto)) = old_key.as_ref()
+                    && let Some(pos) = self.filtered.iter().position(|&i| {
+                        let e = &self.entries[i];
+                        &e.kind == kind && &e.goto == goto
+                    })
+                {
+                    self.cursor = pos;
                 } else if self.cursor >= self.filtered.len() {
                     self.cursor = self.filtered.len().saturating_sub(1);
                 }
@@ -481,11 +496,11 @@ mod tests {
     use crate::model::{Entry, EntryType};
     use std::path::PathBuf;
 
-    fn entry(kind: EntryType) -> Entry {
+    fn entry(kind: EntryType, name: &str, path: PathBuf) -> Entry {
         Entry {
             kind,
-            label: String::new(),
-            path: PathBuf::from("/tmp"),
+            label: name.to_string(),
+            path: path.clone(),
             changes: None,
             branch: None,
             is_open: false,
@@ -493,11 +508,16 @@ mod tests {
             depth: 0,
             ancestors: vec![],
             is_last: false,
-            search_text: String::new(),
-            goto: None,
+            search_text: name.to_string(),
+            goto: Some(crate::model::Goto {
+                session: name.to_string(),
+                path,
+                window: None,
+                pane: None,
+            }),
             parent: None,
             connector: String::new(),
-            search_text_lower: String::new(),
+            search_text_lower: name.to_lowercase(),
         }
     }
 
@@ -508,7 +528,10 @@ mod tests {
             ..Config::default()
         };
         Picker {
-            entries: kinds.iter().map(|k| entry(k.clone())).collect(),
+            entries: kinds
+                .iter()
+                .map(|k| entry(k.clone(), "", PathBuf::from("/tmp")))
+                .collect(),
             filtered: (0..kinds.len()).collect(),
             cursor: 0,
             input: String::new(),
@@ -536,6 +559,7 @@ mod tests {
             stashed_input: String::new(),
             stashed_cursor: 0,
             help_edit: None,
+            touched: false,
         }
     }
 
@@ -731,5 +755,88 @@ mod tests {
         assert_eq!(p.input, "a");
         assert_eq!(p.help_cursor, 0);
         assert_eq!(p.help_scroll, 0);
+    }
+
+    fn payload_with(entries: Vec<Entry>) -> crate::model::Payload {
+        let n = entries.len();
+        crate::model::Payload {
+            entries,
+            config: Config::default(),
+            feedbacks: vec![],
+            entries_found: n,
+        }
+    }
+
+    // Boot keeps re-anchoring to cwd until the user moves: an early
+    // incomplete list must not pin the cursor once the correct list arrives.
+    #[test]
+    fn boot_reanchors_until_touched() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut p = picker_with(&[EntryType::Dir], 0);
+        p.entries = vec![entry(EntryType::Dir, "a", std::path::PathBuf::from("/tmp/ramo-boot-a-xyz"))];
+        p.filtered = p.filtered();
+        p.cursor = p.find_initial_cursor();
+        assert_eq!(p.cursor, 0);
+
+        // Correct list arrives (cwd dir sorts after a): cursor must follow it,
+        // not stick to the index placed for the incomplete list.
+        p.tx
+            .send(Some(payload_with(vec![
+                entry(EntryType::Dir, "a", std::path::PathBuf::from("/tmp/ramo-boot-a-xyz")),
+                entry(EntryType::Dir, "home", cwd.clone()),
+            ])))
+            .unwrap();
+        p.tick();
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "home");
+
+        // A later refresh that only appends must keep the cursor on cwd.
+        p.tx
+            .send(Some(payload_with(vec![
+                entry(EntryType::Dir, "a", std::path::PathBuf::from("/tmp/ramo-boot-a-xyz")),
+                entry(EntryType::Dir, "home", cwd),
+                entry(EntryType::Dir, "z", std::path::PathBuf::from("/tmp/ramo-boot-z-xyz")),
+            ])))
+            .unwrap();
+        p.tick();
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "home");
+    }
+
+    // After the user moves, refreshes preserve the selected entry by
+    // identity (navigation target), not by numeric index.
+    #[test]
+    fn touched_cursor_follows_entry_across_reorder() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut p = picker_with(&[EntryType::Dir], 0);
+        p.entries = vec![
+            entry(EntryType::Dir, "a", std::path::PathBuf::from("/tmp/ramo-reorder-a-xyz")),
+            entry(EntryType::Dir, "b", std::path::PathBuf::from("/tmp/ramo-reorder-b-xyz")),
+        ];
+        p.filtered = p.filtered();
+        p.cursor = 0;
+        assert!(!p.touched);
+
+        // User navigates: down from 0 wraps... use down to reach b.
+        let down = KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        p.handle_input(down);
+        assert!(p.touched);
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "b");
+
+        // Daemon reorders the list: cursor must stay on b (now at 0).
+        p.tx
+            .send(Some(payload_with(vec![
+                entry(EntryType::Dir, "b", std::path::PathBuf::from("/tmp/ramo-reorder-b-xyz")),
+                entry(EntryType::Dir, "a", std::path::PathBuf::from("/tmp/ramo-reorder-a-xyz")),
+            ])))
+            .unwrap();
+        p.tick();
+        assert_eq!(p.cursor, 0);
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "b");
     }
 }

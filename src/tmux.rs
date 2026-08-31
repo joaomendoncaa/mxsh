@@ -18,10 +18,10 @@ pub fn snapshot() -> Snapshot {
         "list-panes",
         "-a",
         "-F",
-        "#{session_name}\t#{session_path}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{session_activity}\t#{window_name}\t#{pane_title}\t#{window_activity}",
+        "#{session_name}\t#{session_path}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{session_activity}",
     ]) {
         let p: Vec<&str> = line.split('\t').collect();
-        if p.len() != 10 {
+        if p.len() != 7 {
             continue;
         }
         panes.push(TmuxPane {
@@ -31,9 +31,6 @@ pub fn snapshot() -> Snapshot {
             current_command: p[4].into(),
             current_path: PathBuf::from(p[5]),
             activity: p[6].parse().unwrap_or(0),
-            window_name: p[7].into(),
-            pane_title: p[8].into(),
-            window_activity: p[9].parse().unwrap_or(0),
         });
         if !sessions.iter().any(|s| s.name == p[0]) {
             sessions.push(TmuxSession {
@@ -62,10 +59,23 @@ fn tmux_lines(args: &[&str]) -> Vec<String> {
 }
 
 pub fn opencode_panes(panes: &[TmuxPane]) -> Vec<&TmuxPane> {
-    panes
-        .iter()
-        .filter(|p| p.current_command.starts_with("opencode"))
-        .collect()
+    // Process-only detection. Whether the pane is an opencode pane is
+    // determined solely by what executable is running in it — either
+    // `opencode` or `opencode2`. Window/pane titles are never consulted,
+    // even as a fallback.
+    panes.iter().filter(|p| is_opencode_command(&p.current_command)).collect()
+}
+
+fn is_opencode_command(cmd: &str) -> bool {
+    // `pane_current_command` is usually the basename, but handle a full
+    // path just in case (e.g. "/usr/local/bin/opencode2").
+    if cmd == "opencode" || cmd == "opencode2" {
+        return true;
+    }
+    if let Some(base) = cmd.rsplit('/').next() {
+        return base == "opencode" || base == "opencode2";
+    }
+    false
 }
 
 // tmux sessions opened outside ramo are still surfaced in the picker
