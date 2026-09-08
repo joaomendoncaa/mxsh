@@ -365,6 +365,8 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
         };
     let connector_style = if effective_dim {
         Style::default().fg(CMD_DIM)
+    } else if is_cursor {
+        Style::default().fg(Color::White)
     } else {
         Style::default().fg(CONNECTOR)
     };
