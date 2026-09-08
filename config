@@ -79,8 +79,8 @@ bind-command-open-detached = o
 bind-help-enter = enter
 bind-help-exit = esc
 bind-command-session-kill = k # uses `kill-session` in tmux, so it doesn't delete your worktree or agent session
-bind-command-worktree-new = n
-bind-command-worktree-delete = d
+bind-command-worktree-new = n # filter input is used as the branch name, empty input auto-names
+bind-command-worktree-delete = d # `git worktree remove --force` + kills its sessions
 
 # defines if the picker should close after jumping to a session
 auto-close = true

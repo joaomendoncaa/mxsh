@@ -303,6 +303,14 @@ impl Picker {
             self.open_detached();
             return;
         }
+        if Config::key_matches(&self.config.bind_command_worktree_new, key) {
+            self.create_worktree();
+            return;
+        }
+        if Config::key_matches(&self.config.bind_command_worktree_delete, key) {
+            self.delete_worktree();
+            return;
+        }
     }
 
     fn check_clickables(&mut self, col: u16, row: u16) -> bool {
@@ -333,6 +341,8 @@ impl Picker {
             }
             Action::KillSession => self.execute_kill_session(),
             Action::OpenDetached => self.open_detached(),
+            Action::WorktreeNew => self.create_worktree(),
+            Action::WorktreeDelete => self.delete_worktree(),
         }
     }
 
@@ -419,7 +429,10 @@ impl Picker {
         }
     }
 
-    fn activate_entry(&mut self, idx: usize) {
+    pub(crate) fn activate_entry(&mut self, idx: usize) {
+        if self.entries[idx].pending {
+            return;
+        }
         let goto = self.entries[idx].goto.clone();
         let Some(goto) = goto else { return };
 

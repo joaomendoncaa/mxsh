@@ -130,6 +130,9 @@ pub fn render(frame: &mut Frame, picker: &mut Picker) {
     let entry_text_width = if !buttons.is_empty() && cursor < n {
         let e = &picker.entries[picker.filtered[cursor]];
         let mut w = e.connector().chars().count() + 2 + e.label.chars().count();
+        if e.kind == EntryType::Worktree && e.depth == 0 && e.is_open {
+            w += 2;
+        }
         if let Some(branch) = &e.branch {
             w += 1 + branch.chars().count();
         }
@@ -370,11 +373,23 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
     } else {
         Style::default()
     };
-    let mut spans = vec![
-        Span::styled(entry.connector(), connector_style),
-        Span::styled(format!("{} ", entry.marker(spinner)), marker_style),
-        Span::styled(entry.label.as_str(), label_style),
-    ];
+    let mut spans = vec![Span::styled(entry.connector(), connector_style)];
+    // Hoisted worktree roots are open sessions too: `* ⑂ label`.
+    if entry.kind == EntryType::Worktree && entry.depth == 0 && entry.is_open {
+        let star_style = if effective_dim {
+            Style::default().fg(CMD_DIM)
+        } else if is_cursor {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled("* ", star_style));
+    }
+    spans.push(Span::styled(
+        format!("{} ", entry.marker(spinner)),
+        marker_style,
+    ));
+    spans.push(Span::styled(entry.label.as_str(), label_style));
     if let Some(branch) = &entry.branch {
         let branch_style = if effective_dim { Style::default().fg(CMD_DIM) } else if is_cursor { Style::default().fg(Color::White).add_modifier(Modifier::DIM) } else { Style::default().fg(Color::DarkGray) };
         spans.push(Span::styled(format!(" {}", branch), branch_style));
@@ -659,6 +674,7 @@ mod tests {
             branch: None,
             is_open: false,
             is_running: false,
+            pending: false,
             depth,
             ancestors: vec![],
             is_last: false,

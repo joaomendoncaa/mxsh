@@ -12,6 +12,8 @@ pub enum Action {
     ExitHelp,
     KillSession,
     OpenDetached,
+    WorktreeNew,
+    WorktreeDelete,
 }
 
 #[derive(Debug, Clone)]

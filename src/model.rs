@@ -100,6 +100,8 @@ pub struct Entry {
     pub branch: Option<String>,
     pub is_open: bool,
     pub is_running: bool,
+    #[serde(default)]
+    pub pending: bool,
     pub depth: usize,
     pub ancestors: Vec<bool>,
     pub is_last: bool,
@@ -151,7 +153,13 @@ impl Entry {
                     ' '
                 }
             }
-            EntryType::Worktree => WORKTREE,
+            EntryType::Worktree => {
+                if self.pending {
+                    SPINNER[frame % SPINNER.len()]
+                } else {
+                    WORKTREE
+                }
+            }
             EntryType::Agent => {
                 if self.is_running {
                     SPINNER[frame % SPINNER.len()]

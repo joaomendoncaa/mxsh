@@ -1,8 +1,9 @@
 use crate::clickable::{Action, Clickable};
 use crate::config::Config;
 use crate::daemon;
+use crate::git;
 use crate::logs;
-use crate::model::{Entry, EntryType, FeedbackEntry, Goto, Payload};
+use crate::model::{Entry, EntryType, FeedbackEntry, FeedbackType, Goto, Payload};
 use crate::tmux;
 use ratatui::layout::Rect;
 use std::sync::mpsc;
@@ -34,6 +35,23 @@ pub(crate) struct HelpEdit {
     pub saved_cursor: usize,
 }
 
+enum OpResult {
+    Created { dest: std::path::PathBuf },
+    Failed { dest: std::path::PathBuf, msg: String },
+}
+
+#[derive(Debug, Clone)]
+struct PendingCreate {
+    dest: std::path::PathBuf,
+    branch: String,
+    dir_path: std::path::PathBuf,
+    dir_label: String,
+    started: Instant,
+}
+
+// ponytail: 60s ceiling, git is instant or hung — a spinner must never stick forever
+const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct Picker {
     pub(crate) entries: Vec<Entry>,
     pub(crate) filtered: Vec<usize>,
@@ -64,6 +82,9 @@ pub struct Picker {
     pub(crate) stashed_cursor: usize,
     pub(crate) help_edit: Option<HelpEdit>,
     pub(crate) touched: bool,
+    op_tx: mpsc::Sender<OpResult>,
+    op_rx: mpsc::Receiver<OpResult>,
+    pending_create: Option<PendingCreate>,
 }
 
 impl Picker {
@@ -71,6 +92,7 @@ impl Picker {
         logs::init("picker").ok();
 
         let (tx, rx) = mpsc::channel::<Option<Payload>>();
+        let (op_tx, op_rx) = mpsc::channel::<OpResult>();
         let auto_close = payload.config.auto_close;
         let entries_found = payload.entries_found.max(payload.entries.len());
         daemon::listen(tx.clone());
@@ -104,6 +126,9 @@ impl Picker {
             stashed_cursor: 0,
             help_edit: None,
             touched: false,
+            op_tx,
+            op_rx,
+            pending_create: None,
         };
         picker.filtered = picker.filtered();
         picker.cursor = picker.find_initial_cursor();
@@ -121,6 +146,10 @@ impl Picker {
         if now.duration_since(self.last_spinner).as_millis() >= spinner_ms {
             self.spinner = self.spinner.wrapping_add(1);
             self.last_spinner = now;
+        }
+
+        while let Ok(op) = self.op_rx.try_recv() {
+            self.handle_op(op);
         }
 
         while let Ok(result) = self.rx.try_recv() {
@@ -164,6 +193,8 @@ impl Picker {
                 }
             }
         }
+
+        self.reconcile_pending();
 
         if let Some(goto) = self.pending_goto.take() {
             return Signal::Goto(goto);
@@ -230,6 +261,9 @@ impl Picker {
             return vec![];
         };
         let entry = &self.entries[idx];
+        if entry.pending {
+            return vec![];
+        }
         let mut buttons = Vec::new();
         if entry.is_open || entry.kind == EntryType::Agent {
             let key = self.config.bind_command_session_kill.to_uppercase();
@@ -238,44 +272,354 @@ impl Picker {
             let key = self.config.bind_command_open_detached.to_uppercase();
             buttons.push((format!("{key} Open Detached"), Action::OpenDetached));
         }
+        if entry.kind == EntryType::Dir || entry.kind == EntryType::Worktree {
+            let key = self.config.bind_command_worktree_new.to_uppercase();
+            buttons.push((format!("{key} New Worktree"), Action::WorktreeNew));
+        }
+        if entry.kind == EntryType::Worktree {
+            let key = self.config.bind_command_worktree_delete.to_uppercase();
+            buttons.push((format!("{key} Delete Worktree"), Action::WorktreeDelete));
+        }
         buttons
     }
 
     pub fn execute_kill_session(&mut self) {
-        if let Some(&idx) = self.filtered.get(self.cursor) {
-            let entry = &self.entries[idx];
-            if (entry.is_open || entry.kind == EntryType::Agent)
-                && let Some(goto) = &entry.goto
-            {
-                if let Some(window) = &goto.window {
-                    tmux::kill_window(&goto.session, *window);
-                } else {
-                    let sanitized = goto.session.replace([':', '.'], "_");
-                    tmux::kill_session(&sanitized);
+        let Some(&idx) = self.filtered.get(self.cursor) else {
+            return;
+        };
+        let entry = self.entries[idx].clone();
+        let Some(goto) = entry.goto.clone() else {
+            return;
+        };
+        if !(entry.is_open || entry.kind == EntryType::Agent) {
+            self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Warning,
+                message: format!("no live session on '{}'", entry.label),
+            });
+            return;
+        }
+        if let Some(window) = goto.window {
+            tmux::kill_window(&goto.session, window);
+        } else {
+            let sanitized = goto.session.replace([':', '.'], "_");
+            tmux::kill_session(&sanitized);
+        }
+        self.mode = Mode::Normal;
+        self.schedule_refresh();
+    }
+
+    pub fn open_detached(&mut self) {
+        let Some(&idx) = self.filtered.get(self.cursor) else {
+            return;
+        };
+        let entry = self.entries[idx].clone();
+        let Some(goto) = entry.goto.clone() else {
+            return;
+        };
+        if entry.is_open || entry.kind == EntryType::Agent || entry.pending {
+            self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Warning,
+                message: format!("nothing to open on '{}'", entry.label),
+            });
+            return;
+        }
+        tmux::open_detached(&goto);
+        let mut cur = Some(idx);
+        while let Some(i) = cur {
+            self.entries[i].is_open = true;
+            cur = self.entries[i].parent;
+        }
+        self.mode = Mode::Normal;
+        self.schedule_refresh();
+    }
+
+    pub fn create_worktree(&mut self) {
+        let Some(&idx) = self.filtered.get(self.cursor) else {
+            return;
+        };
+        let entry = self.entries[idx].clone();
+        if entry.kind == EntryType::Agent || entry.pending {
+            self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Warning,
+                message: "cannot create a worktree here".into(),
+            });
+            return;
+        }
+        let origin = if entry.kind == EntryType::Dir {
+            entry
+        } else if let Some(dir) = entry.parent.and_then(|p| self.entries.get(p)).filter(|e| e.kind == EntryType::Dir) {
+            dir.clone()
+        } else {
+            return;
+        };
+        // The filter input doubles as the branch name; empty input auto-names.
+        let mut branch = git::sanitize_branch_name(self.input.trim());
+        if branch.is_empty() {
+            branch = git::auto_branch_name();
+        }
+        let dest = git::unique_dest(git::plan_worktree(
+            &origin.path,
+            &branch,
+            &self.config.path_worktrees,
+        ));
+        self.pending_create = Some(PendingCreate {
+            dest: dest.clone(),
+            branch: branch.clone(),
+            dir_path: origin.path.clone(),
+            dir_label: origin.label.clone(),
+            started: Instant::now(),
+        });
+        if let Some(p) = self.pending_create.clone() {
+            self.insert_placeholder(&p);
+        }
+        self.mode = Mode::Normal;
+        let tx = self.op_tx.clone();
+        let repo = origin.path.clone();
+        thread::spawn(move || {
+            let res = git::worktree_add(&repo, &dest, &branch);
+            let _ = tx.send(match res {
+                Ok(()) => OpResult::Created { dest },
+                Err(e) => OpResult::Failed { dest, msg: e },
+            });
+        });
+    }
+
+    fn is_in_subtree(&self, mut idx: usize, root: usize) -> bool {
+        while let Some(p) = self.entries.get(idx).and_then(|e| e.parent) {
+            if p == root {
+                return true;
+            }
+            idx = p;
+        }
+        false
+    }
+
+    // Optimistic row at the position the real worktree will take: last
+    // child of its dir. Cursor stays on its entry; viewport reveals the row.
+    fn insert_placeholder(&mut self, p: &PendingCreate) {
+        let Some(dir_idx) = self.entries.iter().position(|e| e.kind == EntryType::Dir && e.path == p.dir_path)
+        else {
+            self.pending_create = None;
+            return;
+        };
+        let cursor_id = self
+            .filtered
+            .get(self.cursor)
+            .and_then(|&i| self.entries.get(i))
+            .map(|e| (e.kind.clone(), e.goto.clone()));
+        if let Some(last) = (0..self.entries.len())
+            .rev()
+            .find(|&i| self.entries[i].parent == Some(dir_idx) && self.entries[i].depth == 1)
+        {
+            self.entries[last].is_last = false;
+            self.entries[last].compute_connector();
+        }
+        let label = p
+            .dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.branch.clone());
+        let mut ph = Entry {
+            kind: EntryType::Worktree,
+            label: label.clone(),
+            path: p.dest.clone(),
+            changes: None,
+            branch: Some(p.branch.clone()),
+            is_open: false,
+            is_running: false,
+            pending: true,
+            depth: 1,
+            ancestors: vec![],
+            is_last: true,
+            search_text: format!("{} {} {}", p.dir_label, label, p.branch),
+            goto: Some(Goto {
+                session: label,
+                path: p.dest.clone(),
+                window: None,
+                pane: None,
+            }),
+            parent: Some(dir_idx),
+            connector: String::new(),
+            search_text_lower: String::new(),
+        };
+        ph.compute_connector();
+        ph.search_text_lower = ph.search_text.to_lowercase();
+        let mut at = dir_idx + 1;
+        while at < self.entries.len() && self.is_in_subtree(at, dir_idx) {
+            at += 1;
+        }
+        self.entries.insert(at, ph);
+        self.filtered = self.filtered();
+        if let Some((kind, goto)) = cursor_id
+            && let Some(pos) = self
+                .filtered
+                .iter()
+                .position(|&i| self.entries[i].kind == kind && self.entries[i].goto == goto)
+        {
+            self.cursor = pos;
+        }
+        self.reveal_path(&p.dest);
+    }
+
+    // Keep the cursor where it is and scroll down just enough to show the
+    // row at `dest`. If both don't fit, render snaps back to the cursor:
+    // it always wins.
+    fn reveal_path(&mut self, dest: &std::path::PathBuf) {
+        let h = self.slot_entries.height as usize;
+        if h == 0 {
+            return;
+        }
+        let rows = self.rows();
+        let row = self
+            .filtered
+            .iter()
+            .position(|&i| self.entries[i].path == *dest)
+            .and_then(|p| rows.iter().position(|&r| r == Some(p)));
+        let cursor_row = rows.iter().position(|&r| r == Some(self.cursor));
+        if let Some(row) = row
+            && cursor_row.is_some()
+        {
+            self.scroll = row.saturating_add(1).saturating_sub(h);
+        }
+    }
+
+    fn handle_op(&mut self, op: OpResult) {
+        match op {
+            OpResult::Created { dest } => {
+                if self.pending_create.as_ref().is_some_and(|p| p.dest == dest) {
+                    self.schedule_refresh();
                 }
-                self.mode = Mode::Normal;
-                self.schedule_refresh();
+            }
+            OpResult::Failed { dest, msg } => {
+                let branch = self
+                    .pending_create
+                    .as_ref()
+                    .filter(|p| p.dest == dest)
+                    .map(|p| p.branch.clone());
+                if let Some(branch) = branch {
+                    self.fail_pending(&dest, format!("cannot create worktree '{branch}': {msg}"));
+                }
             }
         }
     }
 
-    pub fn open_detached(&mut self) {
-        if let Some(&idx) = self.filtered.get(self.cursor) {
-            let entry = &self.entries[idx];
-            if !entry.is_open
-                && entry.kind != EntryType::Agent
-                && let Some(goto) = &entry.goto
+    fn fail_pending(&mut self, dest: &std::path::PathBuf, message: String) {
+        if self.pending_create.as_ref().is_none_or(|p| &p.dest != dest) {
+            return;
+        }
+        let p = self.pending_create.take().unwrap();
+        self.entries.retain(|e| !(e.pending && e.path == p.dest));
+        self.feedbacks.push(FeedbackEntry {
+            level: FeedbackType::Error,
+            message,
+        });
+        self.filtered = self.filtered();
+        // Cursor never moved, but the rows around it did: re-anchor to the origin dir.
+        if let Some(pos) = self
+            .filtered
+            .iter()
+            .position(|&i| self.entries[i].kind == EntryType::Dir && self.entries[i].path == p.dir_path)
+        {
+            self.cursor = pos;
+        } else if self.cursor >= self.filtered.len() {
+            self.cursor = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    // Daemon payloads replace `entries`, wiping the placeholder: re-add it
+    // while the op is in flight. Once the real entry arrives the cursor
+    // stays where it was — the viewport reveals the new child and we
+    // travel straight into it.
+    fn reconcile_pending(&mut self) {
+        if let Some((dest, branch)) = self
+            .pending_create
+            .as_ref()
+            .filter(|p| p.started.elapsed() > PENDING_TIMEOUT)
+            .map(|p| (p.dest.clone(), p.branch.clone()))
+        {
+            self.fail_pending(&dest, format!("timed out creating worktree '{branch}' — check `git worktree list`"));
+            return;
+        }
+        let Some(p) = self.pending_create.clone() else {
+            return;
+        };
+        if self
+            .entries
+            .iter()
+            .any(|e| e.kind == EntryType::Worktree && !e.pending && e.path == p.dest)
+        {
+            self.pending_create = None;
+            self.entries.retain(|e| !e.pending);
+            self.filtered = self.filtered();
+            if self
+                .filtered
+                .iter()
+                .any(|&i| self.entries[i].kind == EntryType::Worktree && self.entries[i].path == p.dest)
             {
-                tmux::open_detached(goto);
-                let mut cur = Some(idx);
-                while let Some(i) = cur {
-                    self.entries[i].is_open = true;
-                    cur = self.entries[i].parent;
+                self.reveal_path(&p.dest);
+            }
+            if let Some(pos) = self.filtered.iter().position(|&i| {
+                self.entries[i].kind == EntryType::Worktree && self.entries[i].path == p.dest
+            }) {
+                let idx = self.filtered[pos];
+                self.activate_entry(idx);
+            }
+            self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Warning,
+                message: format!("✓ worktree '{}' created", p.branch),
+            });
+            return;
+        }
+        if !self.entries.iter().any(|e| e.pending && e.path == p.dest) {
+            self.insert_placeholder(&p);
+        }
+    }
+
+    pub fn delete_worktree(&mut self) {
+        let Some(&idx) = self.filtered.get(self.cursor) else {
+            return;
+        };
+        let entry = self.entries[idx].clone();
+        if entry.kind != EntryType::Worktree || entry.pending {
+            self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Warning,
+                message: "select a worktree entry to delete".into(),
+            });
+            return;
+        }
+        let wt = entry.path.clone();
+        let repo = entry
+            .parent
+            .and_then(|p| self.entries.get(p))
+            .map(|e| e.path.clone())
+            .unwrap_or_else(|| wt.clone());
+        for e in &self.entries {
+            if e.parent == Some(idx)
+                && e.kind == EntryType::Agent
+                && let Some(g) = &e.goto
+            {
+                if let Some(w) = g.window {
+                    tmux::kill_window(&g.session, w);
+                } else {
+                    tmux::kill_session(&g.session.replace([':', '.'], "_"));
                 }
-                self.mode = Mode::Normal;
-                self.schedule_refresh();
             }
         }
+        if let Some(name) = wt.file_name().map(|n| n.to_string_lossy().replace([':', '.'], "_")) {
+            tmux::kill_session(&name);
+        }
+        match git::worktree_remove(&repo, &wt) {
+            Ok(()) => self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Warning,
+                message: format!("✓ worktree {} removed", wt.display()),
+            }),
+            Err(e) => self.feedbacks.push(FeedbackEntry {
+                level: FeedbackType::Error,
+                message: format!("cannot remove worktree: {e}"),
+            }),
+        }
+        self.mode = Mode::Normal;
+        self.schedule_refresh();
     }
 
     pub fn enter_help(&mut self) {
@@ -505,6 +849,7 @@ mod tests {
             branch: None,
             is_open: false,
             is_running: false,
+            pending: false,
             depth: 0,
             ancestors: vec![],
             is_last: false,
@@ -523,6 +868,7 @@ mod tests {
 
     fn picker_with(kinds: &[EntryType], gap: u64) -> Picker {
         let (tx, rx) = mpsc::channel();
+        let (op_tx, op_rx) = mpsc::channel();
         let config = Config {
             style_entries_gap: gap,
             ..Config::default()
@@ -560,6 +906,9 @@ mod tests {
             stashed_cursor: 0,
             help_edit: None,
             touched: false,
+            op_tx,
+            op_rx,
+            pending_create: None,
         }
     }
 
@@ -838,5 +1187,216 @@ mod tests {
         p.tick();
         assert_eq!(p.cursor, 0);
         assert_eq!(p.entries[p.filtered[p.cursor]].label, "b");
+    }
+
+    // Session row with two agents below it, cursor on the session.
+    fn session_tree() -> (Picker, PendingCreate) {
+        let mut p = picker_with(&[EntryType::Dir], 0);
+        let dir_path = PathBuf::from("/tmp/proj");
+        p.entries[0].path = PathBuf::from("/tmp/other");
+        p.entries[0].label = "other".into();
+        let mut dir = entry(EntryType::Dir, "proj", dir_path.clone());
+        dir.search_text = "proj".into();
+        dir.search_text_lower = "proj".into();
+        p.entries.push(dir);
+        for t in ["a1", "a2"] {
+            let mut a = entry(EntryType::Agent, t, dir_path.clone());
+            a.parent = Some(1);
+            a.depth = 1;
+            a.is_last = t == "a2";
+            p.entries.push(a);
+        }
+        p.filtered = p.filtered();
+        p.cursor = 1;
+        p.slot_entries = ratatui::layout::Rect::new(0, 0, 20, 4);
+        let pending = PendingCreate {
+            dest: PathBuf::from("/tmp/proj--feat-x"),
+            branch: "feat/x".into(),
+            dir_path: dir_path.clone(),
+            dir_label: "proj".into(),
+            started: Instant::now(),
+        };
+        (p, pending)
+    }
+
+    // Optimistic insert: cursor stays on the session, spinner row lands
+    // last, viewport reveals it (cursor + agents + loading row in view).
+    #[test]
+    fn optimistic_placeholder_keeps_cursor_and_reveals() {
+        let (mut p, pending) = session_tree();
+        p.pending_create = Some(pending.clone());
+        p.insert_placeholder(&pending);
+        assert_eq!(p.entries.len(), 5);
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "proj");
+        let ph = &p.entries[4];
+        assert!(ph.pending);
+        assert_eq!(ph.label, "proj--feat-x");
+        assert_eq!(ph.branch.as_deref(), Some("feat/x"));
+        assert!(ph.is_last);
+        assert!(!p.entries[3].is_last);
+        assert_eq!(ph.marker(0), '\u{280b}');
+        assert_eq!(p.scroll, 1);
+    }
+
+    // Failed create: spinner vanishes, error shows, cursor never moved.
+    #[test]
+    fn failed_create_removes_placeholder() {
+        let (mut p, pending) = session_tree();
+        p.pending_create = Some(pending.clone());
+        p.insert_placeholder(&pending);
+        assert_eq!(p.entries.len(), 5);
+        p.handle_op(OpResult::Failed {
+            dest: pending.dest.clone(),
+            msg: "boom".into(),
+        });
+        assert!(p.pending_create.is_none());
+        assert_eq!(p.entries.len(), 4);
+        assert!(!p.entries.iter().any(|e| e.pending));
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "proj");
+        assert!(p.feedbacks.iter().any(|f| f.message.contains("boom")));
+    }
+
+    // Daemon confirms the real entry: placeholder swaps out, cursor stays
+    // on the origin session, viewport reveals the child, we travel into it.
+    #[test]
+    fn reconcile_keeps_cursor_reveals_and_travels() {
+        let (mut p, pending) = session_tree();
+        p.pending_create = Some(pending.clone());
+        p.insert_placeholder(&pending);
+        let mut real = entry(EntryType::Worktree, "proj--feat-x", pending.dest.clone());
+        real.parent = Some(1);
+        real.depth = 1;
+        real.branch = Some("feat/x".into());
+        real.search_text = "proj proj--feat-x feat/x".into();
+        real.search_text_lower = real.search_text.to_lowercase();
+        p.entries = vec![
+            p.entries[0].clone(),
+            p.entries[1].clone(),
+            p.entries[2].clone(),
+            p.entries[3].clone(),
+            real,
+        ];
+        p.reconcile_pending();
+        assert!(p.pending_create.is_none());
+        assert!(!p.entries.iter().any(|e| e.pending));
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "proj");
+        assert!(!p.touched);
+        assert_eq!(p.scroll, 1);
+        let goto = p.pending_goto.clone().expect("travels into the new worktree");
+        assert_eq!(goto.path, pending.dest);
+    }
+
+    // Full async flow against real git: placeholder is instant, background
+    // thread creates the worktree, spinner survives until daemon confirms.
+    #[test]
+    fn create_worktree_async_flow() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("ramo_flow_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(a)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&["init", "-b", "main"]));
+        assert!(run(&["config", "user.email", "t@t"]));
+        assert!(run(&["config", "user.name", "t"]));
+        assert!(run(&["config", "commit.gpgsign", "false"]));
+        std::fs::write(repo.join("f.txt"), "hi\n").unwrap();
+        assert!(run(&["add", "."]));
+        assert!(run(&["commit", "-m", "init"]));
+
+        let mut p = picker_with(&[EntryType::Dir], 0);
+        p.entries[0].path = repo.clone();
+        p.entries[0].label = "myrepo".into();
+        p.entries[0].search_text = "myrepo".into();
+        p.entries[0].search_text_lower = "myrepo".into();
+        p.filtered = p.filtered();
+        p.cursor = 0;
+        p.input = "feat/flow".into();
+        p.create_worktree();
+
+        // Placeholder is synchronous; cursor never moved.
+        assert_eq!(p.entries.len(), 2);
+        assert!(p.entries[1].pending);
+        assert_eq!(p.cursor, 0);
+        let dest = p.pending_create.clone().unwrap().dest;
+
+        // Background thread does the real git work; drain completions via tick.
+        let t0 = std::time::Instant::now();
+        while !dest.join("f.txt").is_file() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            p.tick();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        p.tick();
+        assert!(dest.join("f.txt").is_file(), "worktree created in background");
+        assert!(
+            p.entries.iter().any(|e| e.pending),
+            "spinner persists until daemon confirms"
+        );
+        assert_eq!(p.cursor, 0);
+
+        // Simulated daemon payload with the real entry: jump to it.
+        let mut real = entry(EntryType::Worktree, "myrepo--feat-flow", dest.clone());
+        real.parent = Some(0);
+        real.depth = 1;
+        real.branch = Some("feat/flow".into());
+        real.search_text = "myrepo myrepo--feat-flow feat/flow".into();
+        real.search_text_lower = real.search_text.to_lowercase();
+        let mut dir = entry(EntryType::Dir, "myrepo", repo.clone());
+        dir.search_text = "myrepo".into();
+        dir.search_text_lower = "myrepo".into();
+        p.entries = vec![dir, real];
+        p.reconcile_pending();
+        assert!(!p.entries.iter().any(|e| e.pending));
+        assert_eq!(p.entries[p.filtered[p.cursor]].label, "myrepo");
+        assert!(!p.touched);
+        let goto = p.pending_goto.clone().expect("travels into the new worktree");
+        assert_eq!(goto.path, dest);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A hung git must not stick the spinner forever: 60s ceiling.
+    #[test]
+    fn stale_pending_times_out() {
+        let (mut p, mut pending) = session_tree();
+        pending.started = Instant::now() - std::time::Duration::from_secs(61);
+        p.pending_create = Some(pending.clone());
+        p.insert_placeholder(&pending);
+        assert_eq!(p.entries.len(), 5);
+        p.reconcile_pending();
+        assert!(p.pending_create.is_none());
+        assert!(!p.entries.iter().any(|e| e.pending));
+        assert_eq!(p.entries.len(), 4);
+        assert!(p.feedbacks.iter().any(|f| f.message.contains("timed out")));
+        assert_eq!(p.cursor, 1);
+    }
+
+    // Command keys on rows they can't act on say so instead of going silent.
+    #[test]
+    fn kill_without_session_warns() {
+        let mut p = picker_with(&[EntryType::Dir], 0);
+        p.execute_kill_session();
+        assert!(!p.quit);
+        assert!(p.feedbacks.iter().any(|f| f.message.contains("no live session")));
+        p.feedbacks.clear();
+        p.entries[0].is_open = true;
+        p.open_detached();
+        assert!(p.feedbacks.iter().any(|f| f.message.contains("nothing to open")));
     }
 }
