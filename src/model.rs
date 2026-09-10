@@ -34,6 +34,7 @@ pub struct TmuxPane {
     pub session_name: String,
     pub window_index: usize,
     pub pane_index: usize,
+    pub pane_id: String,
     pub current_command: String,
     pub current_path: PathBuf,
     pub activity: i64,
@@ -45,6 +46,7 @@ pub struct Opencode {
     pub title: String,
     pub directory: PathBuf,
     pub time_updated: i64,
+    pub time_viewed: i64,
     pub is_running: bool,
 }
 

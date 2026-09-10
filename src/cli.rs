@@ -11,9 +11,15 @@ pub enum Daemon {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Plugin {
+    Install,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Run,
     Daemon(Daemon),
+    Plugin(Plugin),
     Kill,
     Help,
     Config,
@@ -53,6 +59,17 @@ impl Cli {
                     };
                 }
                 "kill" => command = Command::Kill,
+                "plugin" => {
+                    i += 1;
+                    command = if i < args.len() {
+                        match args[i].as_str() {
+                            "install" => Command::Plugin(Plugin::Install),
+                            _ => Command::Unknown(unknown_cmd(&args)),
+                        }
+                    } else {
+                        Command::Unknown(unknown_cmd(&args))
+                    };
+                }
                 "purge" => command = Command::Purge { with_config: false },
                 "self-destruct" => command = Command::SelfDestruct { with_config: true },
                 "config" => command = Command::Config,
@@ -124,6 +141,8 @@ ramo purge                Remove daemon service and state (keeps config)\n\
 ramo purge --with-config  Remove daemon service, state and config\n\
 \n\
 ramo kill           Alias for daemon kill\n\
+\n\
+ramo plugin install Install opencode TUI plugin for exact per-pane session tracking\n\
 \n\
 ramo config         Print config path and contents\n\
 \n\

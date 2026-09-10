@@ -1,0 +1,8 @@
+{
+    "name": "ramo",
+    "version": "0.0.0",
+    "type": "module",
+    "exports": {
+        "./tui": "./tui.js"
+    }
+}

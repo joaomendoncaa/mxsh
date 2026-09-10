@@ -7,19 +7,20 @@ mod events;
 mod filter;
 mod git;
 mod help;
+mod integration;
 mod logs;
 mod model;
-mod opencode;
 mod picker;
 mod purge;
 mod renderer;
+mod report;
 mod selfdestruct;
 mod service;
 mod terminal;
 mod tmux;
 mod util;
 
-use cli::{Cli, Command, Daemon};
+use cli::{Cli, Command, Daemon, Plugin};
 use config::Config;
 use picker::Picker;
 use std::io;
@@ -51,6 +52,13 @@ fn main() -> io::Result<()> {
         }
         Command::Daemon(Daemon::Install) => {
             return service::install();
+        }
+        Command::Plugin(Plugin::Install) => {
+            match integration::opencode::plugin_install() {
+                Ok(()) => println!("plugin installed"),
+                Err(e) => eprintln!("ramo plugin install: {e}"),
+            }
+            return Ok(());
         }
         Command::Daemon(Daemon::Uninstall) => {
             return service::uninstall();

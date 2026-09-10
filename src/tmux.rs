@@ -18,19 +18,20 @@ pub fn snapshot() -> Snapshot {
         "list-panes",
         "-a",
         "-F",
-        "#{session_name}\t#{session_path}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{session_activity}",
+        "#{session_name}\t#{session_path}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{session_activity}",
     ]) {
         let p: Vec<&str> = line.split('\t').collect();
-        if p.len() != 7 {
+        if p.len() != 8 {
             continue;
         }
         panes.push(TmuxPane {
             session_name: p[0].into(),
             window_index: p[2].parse().unwrap_or(0),
             pane_index: p[3].parse().unwrap_or(0),
-            current_command: p[4].into(),
-            current_path: PathBuf::from(p[5]),
-            activity: p[6].parse().unwrap_or(0),
+            pane_id: p[4].into(),
+            current_command: p[5].into(),
+            current_path: PathBuf::from(p[6]),
+            activity: p[7].parse().unwrap_or(0),
         });
         if !sessions.iter().any(|s| s.name == p[0]) {
             sessions.push(TmuxSession {

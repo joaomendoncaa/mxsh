@@ -2,6 +2,7 @@ use crate::builder::TreeBuilder;
 use crate::config::Config;
 use crate::logs;
 use crate::model::{Entry, FeedbackEntry, FeedbackType, Payload};
+use crate::report;
 use crate::service;
 use serde::{Deserialize, Serialize};
 
@@ -277,7 +278,9 @@ pub fn start(overrides: Vec<(String, Option<String>)>) -> std::io::Result<()> {
     let config_file = Config::config_path();
     let config_lock = Arc::new(RwLock::new(config));
     let feedback_lock = Arc::new(RwLock::new(feedbacks));
-    let builder = Arc::new(TreeBuilder::new());
+    let reports = crate::report::ReportMap::default();
+    spawn_listener(reports.clone());
+    let builder = Arc::new(TreeBuilder::new(reports));
     let clients: ClientList = Arc::new(Mutex::new(Vec::new()));
 
     info!(
@@ -559,6 +562,57 @@ pub fn listen(tx: mpsc::Sender<Option<Payload>>) {
             }
         }
     });
+}
+
+fn report_sock_path() -> PathBuf {
+    logs::state_dir().join("report.sock")
+}
+
+/// Receive `{pane_id, agent_session_id}` reports. Reporter-agnostic: the
+/// daemon owns the socket, whoever can frame JSON gets to report.
+fn spawn_listener(reports: report::ReportMap) {
+    thread::spawn(move || {
+        let sock = report_sock_path();
+        let _ = std::fs::remove_file(&sock);
+        let listener = match UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("report listener unavailable ({}): {e}", sock.display());
+                return;
+            }
+        };
+        info!("report listener on {}", sock.display());
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    match read_frame(&mut stream) {
+                        Ok(bytes) => insert_report(&reports, &bytes),
+                        Err(e) => warn!("bad report frame: {e}"),
+                    }
+                }
+                Err(e) => {
+                    warn!("report accept error: {e}");
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
+
+fn insert_report(reports: &report::ReportMap, bytes: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let (Some(pane), Some(session)) = (
+        v.get("pane_id").and_then(|p| p.as_str()),
+        v.get("agent_session_id").and_then(|s| s.as_str()),
+    ) else {
+        return;
+    };
+    if !pane.is_empty() {
+        report::insert(reports, pane, session);
+    }
 }
 
 pub fn spawn(overrides: &[(String, Option<String>)]) -> Option<()> {

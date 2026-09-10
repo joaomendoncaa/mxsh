@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::git::GitCache;
+use crate::integration::opencode;
 use crate::model::{
     Changes, Entry, EntryType, Goto, Opencode, TmuxPane, TmuxSession, WorktreeInfo,
 };
-use crate::opencode;
+use crate::report;
 use crate::tmux;
 use crate::util;
 use std::collections::{HashMap, HashSet};
@@ -11,12 +12,14 @@ use std::path::{Path, PathBuf};
 
 pub struct TreeBuilder {
     git_cache: GitCache,
+    reports: report::ReportMap,
 }
 
 impl TreeBuilder {
-    pub fn new() -> Self {
+    pub fn new(reports: report::ReportMap) -> Self {
         TreeBuilder {
             git_cache: GitCache::new(),
+            reports,
         }
     }
 
@@ -30,14 +33,19 @@ impl TreeBuilder {
     pub fn build(&self, config: &Config) -> Vec<Entry> {
         let (tmux_snapshot, oc_sessions) = std::thread::scope(|s| {
             let tmux_h = s.spawn(tmux::snapshot);
-            let oc_h = s.spawn(opencode::list_sessions);
+            let oc_h = s.spawn(|| opencode::sessions().unwrap_or_default());
             (tmux_h.join().unwrap(), oc_h.join().unwrap())
         });
         let sessions = tmux_snapshot.sessions;
         let panes = tmux_snapshot.panes;
 
         let oc_panes = tmux::opencode_panes(&panes);
-        let pane_sessions = match_panes_to_sessions(&oc_panes, &oc_sessions);
+        // Drop reports for dead panes so a reused pane id can't ghost.
+        report::prune(
+            &self.reports,
+            &panes.iter().map(|p| p.pane_id.clone()).collect(),
+        );
+        let pane_sessions = match_panes_to_sessions(&oc_panes, &oc_sessions, &self.reports);
 
         let dirs = self.parse_directories(&config.path);
         let open: HashSet<PathBuf> = dirs
@@ -65,7 +73,11 @@ impl TreeBuilder {
 
         let mut covered_paths: Vec<PathBuf> = dirs.iter().map(|d| d.path.clone()).collect();
         // Sessions living in a worktree are represented as its child, never as external.
-        covered_paths.extend(git_data.iter().flat_map(|g| g.worktrees.iter().map(|w| w.path.clone())));
+        covered_paths.extend(
+            git_data
+                .iter()
+                .flat_map(|g| g.worktrees.iter().map(|w| w.path.clone())),
+        );
         let covered_names: Vec<String> = dirs.iter().map(|d| d.name.clone()).collect();
 
         let branches: Vec<Option<String>> = {
@@ -190,7 +202,11 @@ impl TreeBuilder {
 
     fn git_phase(&self, dirs: &[DirInfo], open: &HashSet<PathBuf>, config: &Config) -> Vec<DirGit> {
         // Non-main worktrees are first-class: always listed, like directories.
-        let wts_of = |dir: &DirInfo| -> (Vec<WorktreeInfo>, HashMap<PathBuf, Changes>, Vec<Option<String>>) {
+        let wts_of = |dir: &DirInfo| -> (
+            Vec<WorktreeInfo>,
+            HashMap<PathBuf, Changes>,
+            Vec<Option<String>>,
+        ) {
             let worktrees: Vec<WorktreeInfo> = self
                 .git_cache
                 .worktrees(&dir.path)
@@ -348,7 +364,11 @@ fn build_dir_entry(
                 .collect();
             WtEntry {
                 is_open: sessions.iter().any(|s| s.path == wt.path) || !wt_sessions.is_empty(),
-                diff: git.worktree_diffs.get(&wt.path).cloned().unwrap_or_default(),
+                diff: git
+                    .worktree_diffs
+                    .get(&wt.path)
+                    .cloned()
+                    .unwrap_or_default(),
                 branch: git.worktree_branches.get(wi).cloned().flatten(),
                 sessions: wt_sessions,
                 info: wt.clone(),
@@ -672,25 +692,52 @@ fn synthetic(p: &TmuxPane) -> Opencode {
         title: "New session".into(),
         directory: p.current_path.clone(),
         time_updated: p.activity,
+        time_viewed: 0,
         is_running: false,
     }
 }
 
-fn match_panes_to_sessions(panes: &[&TmuxPane], sessions: &[Opencode]) -> Vec<PaneSession> {
+fn match_panes_to_sessions(
+    panes: &[&TmuxPane],
+    sessions: &[Opencode],
+    reports: &report::ReportMap,
+) -> Vec<PaneSession> {
     // a pane is an opencode pane iff `tmux::opencode_panes`
     // classified it by `pane_current_command` the correlation to
-    // opencode's api is done with the path and recency. pick the most
-    // recently updated session whose `directory` contains the pane's cwd.
+    // opencode's api is done in two layers. first the TUI plugin report:
+    // the plugin inside the pane sees switches and `/new` that emit
+    // nothing server-side, so a fresh report for the pane wins outright
+    // (hook authority). otherwise the most recently *viewed* session
+    // whose `directory` contains the pane's cwd (`updated` only moves on
+    // new messages, so it sticks to the previous session after `/new`
+    // or a TUI session switch).
+    // `is_running` is display-only (spinner), never a match key: a
+    // background agent must not steal the binding from what's on screen.
     // The session's own `title`/`is_running` are used verbatim
     let mut used = HashSet::new();
     let mut sorted = panes.to_vec();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.activity));
     let mut out = Vec::with_capacity(sorted.len());
     for p in &sorted {
-        let best = sessions
-            .iter()
-            .filter(|s| !used.contains(&s.id) && is_in(&p.current_path, &s.directory))
-            .max_by_key(|s| s.time_updated);
+        let reported = (!p.pane_id.is_empty())
+            .then(|| report::reported_session(reports, &p.pane_id))
+            .flatten();
+        let mut recency = || {
+            sessions
+                .iter()
+                .filter(|s| !used.contains(&s.id) && is_in(&p.current_path, &s.directory))
+                .max_by_key(|s| (s.time_viewed, s.time_updated))
+        };
+        // Known session-less pane (fresh TUI): synthetic row, never a
+        // stale title. Unknown reported id: ignore, fall back to recency.
+        let best = match reported.as_deref() {
+            Some("") => None,
+            Some(id) => sessions
+                .iter()
+                .find(|s| s.id == id && !used.contains(&s.id))
+                .or_else(recency),
+            None => recency(),
+        };
         if let Some(s) = best {
             used.insert(s.id.clone());
             out.push(PaneSession {
@@ -725,7 +772,11 @@ mod tests {
 
     fn dirinfo(path: &str) -> DirInfo {
         DirInfo {
-            name: PathBuf::from(path).file_name().unwrap().to_string_lossy().into_owned(),
+            name: PathBuf::from(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             path: PathBuf::from(path),
         }
     }
@@ -786,8 +837,16 @@ mod tests {
     #[test]
     fn mismatched_worktrees_hoist_to_their_section() {
         let mut entries = vec![
-            direntry("proj", false, vec![("/p/proj--a", true), ("/p/proj--b", false)]),
-            direntry("open", true, vec![("/p/open--c", true), ("/p/open--d", false)]),
+            direntry(
+                "proj",
+                false,
+                vec![("/p/proj--a", true), ("/p/proj--b", false)],
+            ),
+            direntry(
+                "open",
+                true,
+                vec![("/p/open--c", true), ("/p/open--d", false)],
+            ),
         ];
         let (open_roots, quiet_roots) = split_roots(&mut entries);
         assert_eq!(open_roots.len(), 1);
@@ -826,6 +885,148 @@ mod tests {
         let dead = build_dir_entry(&dir, &git, None, &[], &[], &[]);
         assert!(!dead.worktrees[0].is_open);
         assert_eq!(dead.worktrees.len(), 1);
+    }
+
+    fn oc_pane(path: &str) -> TmuxPane {
+        TmuxPane {
+            session_name: "proj".into(),
+            window_index: 0,
+            pane_index: 0,
+            pane_id: "%1".into(),
+            current_command: "opencode".into(),
+            current_path: PathBuf::from(path),
+            activity: 100,
+        }
+    }
+
+    fn oc_session(id: &str, updated: i64, viewed: i64, running: bool) -> Opencode {
+        Opencode {
+            id: id.into(),
+            title: id.into(),
+            directory: PathBuf::from("/p/proj"),
+            time_updated: updated,
+            time_viewed: viewed,
+            is_running: running,
+        }
+    }
+
+    fn empty_reports() -> report::ReportMap {
+        report::ReportMap::default()
+    }
+
+    #[test]
+    fn switched_session_prefers_viewed_over_updated() {
+        // TUI session switch (or `/new`) reuses the same pane: the old
+        // session is recently updated but no longer viewed, the new one
+        // is freshly viewed with an older updated timestamp. The old
+        // `updated`-only key stuck to the previous title until a new
+        // message was sent.
+        let pane = oc_pane("/p/proj");
+        let panes = vec![&pane];
+        let out = match_panes_to_sessions(
+            &panes,
+            &[
+                oc_session("old", 200, 100, false),
+                oc_session("new", 100, 200, false),
+            ],
+            &empty_reports(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session.id, "new");
+    }
+
+    #[test]
+    fn running_does_not_outrank_viewed() {
+        // A background running session must not steal the pane binding
+        // from the session actually on screen.
+        let pane = oc_pane("/p/proj");
+        let panes = vec![&pane];
+        let out = match_panes_to_sessions(
+            &panes,
+            &[
+                oc_session("bg", 100, 100, true),
+                oc_session("shown", 100, 200, false),
+            ],
+            &empty_reports(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session.id, "shown");
+    }
+
+    #[test]
+    fn plugin_report_wins_over_recency() {
+        use std::time::Instant;
+        // The TUI plugin saw the switch: the displayed session binds even
+        // though every recency signal favors the previous one.
+        let pane = oc_pane("/p/proj");
+        let panes = vec![&pane];
+        let reports = empty_reports();
+        reports
+            .lock()
+            .unwrap()
+            .insert("%1".into(), ("new".into(), Instant::now()));
+        let out = match_panes_to_sessions(
+            &panes,
+            &[
+                oc_session("old", 300, 300, true),
+                oc_session("new", 100, 100, false),
+            ],
+            &reports,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session.id, "new");
+    }
+
+    #[test]
+    fn unknown_reported_session_falls_back_to_recency() {
+        use std::time::Instant;
+        // Report for a session id the list doesn't know (race): ignore it
+        // instead of dropping to synthetic.
+        let pane = oc_pane("/p/proj");
+        let panes = vec![&pane];
+        let reports = empty_reports();
+        reports
+            .lock()
+            .unwrap()
+            .insert("%1".into(), ("ghost".into(), Instant::now()));
+        let out = match_panes_to_sessions(&panes, &[oc_session("old", 200, 200, false)], &reports);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session.id, "old");
+    }
+
+    #[test]
+    fn reported_empty_pane_gets_synthetic_row() {
+        use std::time::Instant;
+        // Fresh TUI, no session yet: synthetic "New session", never the
+        // previous title — even though recency has a session to offer.
+        let pane = oc_pane("/p/proj");
+        let panes = vec![&pane];
+        let reports = empty_reports();
+        reports
+            .lock()
+            .unwrap()
+            .insert("%1".into(), ("".into(), Instant::now()));
+        let out = match_panes_to_sessions(&panes, &[oc_session("old", 200, 200, false)], &reports);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].session.id.starts_with("synthetic:"));
+        assert_eq!(out[0].session.title, "New session");
+    }
+
+    #[test]
+    fn stale_empty_verdict_falls_back_to_recency() {
+        use std::time::{Duration, Instant};
+        // Plugin died right after the heartbeat: a 30s-old empty verdict
+        // must not pin the pane to synthetic.
+        let pane = oc_pane("/p/proj");
+        let panes = vec![&pane];
+        let reports = empty_reports();
+        reports.lock().unwrap().insert(
+            "%1".into(),
+            ("".into(), Instant::now() - Duration::from_secs(31)),
+        );
+        let out = match_panes_to_sessions(&panes, &[oc_session("old", 200, 200, false)], &reports);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session.id, "old");
     }
 }
 
