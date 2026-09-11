@@ -5,68 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-fn default_bind_help() -> char {
-    '?'
-}
-fn default_bind_quit() -> String {
-    "esc,ctrl-c,ctrl-q".into()
-}
-fn default_bind_nav_up() -> String {
-    "up,ctrl-p".into()
-}
-fn default_bind_nav_down() -> String {
-    "down,ctrl-n".into()
-}
-fn default_bind_nav_page_up() -> String {
-    "ctrl-u".into()
-}
-fn default_bind_nav_page_down() -> String {
-    "ctrl-d".into()
-}
-fn default_bind_input_left() -> String {
-    "left".into()
-}
-fn default_bind_input_right() -> String {
-    "right".into()
-}
-fn default_bind_input_home() -> String {
-    "ctrl-a".into()
-}
-fn default_bind_input_end() -> String {
-    "ctrl-e".into()
-}
-fn default_bind_input_kill_line() -> String {
-    "ctrl-k".into()
-}
-fn default_bind_input_delete_word() -> String {
-    "ctrl-w".into()
-}
-fn default_bind_input_clear() -> String {
-    "ctrl-r".into()
-}
-fn default_bind_input_word_left() -> String {
-    "alt-b".into()
-}
-fn default_bind_input_word_right() -> String {
-    "alt-f".into()
-}
-fn default_bind_input_backspace() -> String {
-    "backspace".into()
-}
-fn default_bind_input_delete() -> String {
-    "delete".into()
-}
-fn default_bind_command_exit() -> String {
-    "esc,backspace".into()
-}
-fn default_bind_command_open_detached() -> String {
-    "o".into()
-}
-fn default_bind_help_enter() -> String {
-    "enter".into()
-}
-fn default_bind_help_exit() -> String {
-    "esc".into()
+pub type CSV = Vec<String>;
+
+fn default_path() -> String {
+    std::env::var("HOME")
+        .map(|h| format!("{h}/Projects/*"))
+        .unwrap_or_else(|_| "~/Projects/*".to_string())
 }
 
 fn strip_inline_value(s: &str) -> String {
@@ -77,12 +21,15 @@ fn strip_inline_value(s: &str) -> String {
     }
 }
 
+fn canonical_key(key: &str) -> String {
+    key.replace('-', "_")
+}
+
 macro_rules! config {
-    ( $( $field:ident : $ty:ty = $default:expr => $key:literal : $kind:ident $(: $serde:literal)? ),* $(,)? ) => {
+    ( $( $field:ident : $ty:ident = $default:expr ),* $(,)? ) => {
         #[derive(Clone, Debug, Serialize, Deserialize)]
         pub struct Config {
             $(
-                $(#[serde(default = $serde)])?
                 pub $field: $ty,
             )*
         }
@@ -97,82 +44,115 @@ macro_rules! config {
 
         impl Config {
             pub fn value_string(&self, key: &str) -> Option<String> {
-                match key {
-                    $($key => Some(self.$field.to_string()),)*
+                let key = canonical_key(key);
+                match key.as_str() {
+                    $(stringify!($field) => Some(config!(@str $field : $ty, &self.$field)),)*
                     _ => None,
                 }
             }
 
             fn set_field(&mut self, key: &str, value: &str, feedbacks: &mut Vec<FeedbackEntry>) -> bool {
-                match key {
-                    $($key => config!(@set $kind, &mut self.$field, key, value, feedbacks),)*
-                    _ => false,
-                }
+                let normalized = canonical_key(key);
+                $(
+                    if normalized == stringify!($field) {
+                        return config!(@set $field : $ty, &mut self.$field, key, value, feedbacks);
+                    }
+                )*
+                false
             }
 
             fn reset_field(&mut self, key: &str) -> bool {
                 let d = Config::default();
-                match key {
-                    $($key => { self.$field = d.$field; true },)*
+                let key = canonical_key(key);
+                match key.as_str() {
+                    $(stringify!($field) => { self.$field = d.$field; true },)*
                     _ => false,
                 }
             }
         }
     };
-    (@set string, $slot:expr, $key:expr, $value:expr, $fb:expr) => { { *$slot = $value.to_string(); true } };
-    (@set char, $slot:expr, $key:expr, $value:expr, $fb:expr) => { set_char($slot, $key, $value, $fb) };
-    (@set bool, $slot:expr, $key:expr, $value:expr, $fb:expr) => { set_bool($slot, $key, $value, $fb) };
-    (@set u64, $slot:expr, $key:expr, $value:expr, $fb:expr) => { set_u64($slot, $key, $value, $fb) };
-    (@set path, $slot:expr, $key:expr, $value:expr, $fb:expr) => { set_path($slot, $key, $value, $fb) };
+    (@set path : String, $slot:expr, $key:expr, $value:expr, $fb:expr) => { {
+        match parse_path_list($key, $value) {
+            Ok(v) => *$slot = v,
+            Err(m) => $fb.push(FeedbackEntry { level: FeedbackType::Error, message: m }),
+        }
+        true
+    } };
+    (@set $field:ident : CSV, $slot:expr, $key:expr, $value:expr, $fb:expr) => { { *$slot = parse_csv($value); true } };
+    (@set $field:ident : String, $slot:expr, $key:expr, $value:expr, $fb:expr) => { { *$slot = parse_string($value); true } };
+    (@set $field:ident : char, $slot:expr, $key:expr, $value:expr, $fb:expr) => { {
+        match parse_char($key, $value) {
+            Ok(v) => *$slot = v,
+            Err(m) => $fb.push(FeedbackEntry { level: FeedbackType::Error, message: m }),
+        }
+        true
+    } };
+    (@set $field:ident : bool, $slot:expr, $key:expr, $value:expr, $fb:expr) => { {
+        match parse_bool($key, $value) {
+            Ok(v) => *$slot = v,
+            Err(m) => $fb.push(FeedbackEntry { level: FeedbackType::Error, message: m }),
+        }
+        true
+    } };
+    (@set $field:ident : u64, $slot:expr, $key:expr, $value:expr, $fb:expr) => { {
+        match parse_u64($key, $value) {
+            Ok(v) => *$slot = v,
+            Err(m) => $fb.push(FeedbackEntry { level: FeedbackType::Error, message: m }),
+        }
+        true
+    } };
+    (@str $field:ident : CSV, $slot:expr) => { $slot.join(", ") };
+    (@str $field:ident : $ty:ident, $slot:expr) => { $slot.to_string() };
 }
 
 config! {
-    path: String = { std::env::var("HOME").map(|h| format!("{h}/Projects/*")).unwrap_or_else(|_| "~/Projects/*".to_string()) } => "path" : path,
-    path_worktrees: String = String::new() => "path-worktrees" : string,
-    bind_jumpto: String = "enter".to_string() => "bind-jumpto" : string,
-    bind_command_mode: char = ':' => "bind-command-mode" : char,
-    bind_help: char = '?' => "bind-help" : char : "default_bind_help",
-    bind_command_session_kill: String = "k".to_string() => "bind-command-session-kill" : string,
-    bind_command_worktree_new: String = "n".to_string() => "bind-command-worktree-new" : string,
-    bind_command_worktree_delete: String = "d".to_string() => "bind-command-worktree-delete" : string,
-    bind_quit: String = "esc,ctrl-c,ctrl-q".to_string() => "bind-quit" : string : "default_bind_quit",
-    bind_nav_up: String = "up,ctrl-p".to_string() => "bind-nav-up" : string : "default_bind_nav_up",
-    bind_nav_down: String = "down,ctrl-n".to_string() => "bind-nav-down" : string : "default_bind_nav_down",
-    bind_nav_page_up: String = "ctrl-u".to_string() => "bind-nav-page-up" : string : "default_bind_nav_page_up",
-    bind_nav_page_down: String = "ctrl-d".to_string() => "bind-nav-page-down" : string : "default_bind_nav_page_down",
-    bind_input_left: String = "left".to_string() => "bind-input-left" : string : "default_bind_input_left",
-    bind_input_right: String = "right".to_string() => "bind-input-right" : string : "default_bind_input_right",
-    bind_input_home: String = "ctrl-a".to_string() => "bind-input-home" : string : "default_bind_input_home",
-    bind_input_end: String = "ctrl-e".to_string() => "bind-input-end" : string : "default_bind_input_end",
-    bind_input_kill_line: String = "ctrl-k".to_string() => "bind-input-kill-line" : string : "default_bind_input_kill_line",
-    bind_input_delete_word: String = "ctrl-w".to_string() => "bind-input-delete-word" : string : "default_bind_input_delete_word",
-    bind_input_clear: String = "ctrl-r".to_string() => "bind-input-clear" : string : "default_bind_input_clear",
-    bind_input_word_left: String = "alt-b".to_string() => "bind-input-word-left" : string : "default_bind_input_word_left",
-    bind_input_word_right: String = "alt-f".to_string() => "bind-input-word-right" : string : "default_bind_input_word_right",
-    bind_input_backspace: String = "backspace".to_string() => "bind-input-backspace" : string : "default_bind_input_backspace",
-    bind_input_delete: String = "delete".to_string() => "bind-input-delete" : string : "default_bind_input_delete",
-    bind_command_exit: String = "esc,backspace".to_string() => "bind-command-exit" : string : "default_bind_command_exit",
-    bind_command_open_detached: String = "o".to_string() => "bind-command-open-detached" : string : "default_bind_command_open_detached",
-    bind_help_enter: String = "enter".to_string() => "bind-help-enter" : string : "default_bind_help_enter",
-    bind_help_exit: String = "esc".to_string() => "bind-help-exit" : string : "default_bind_help_exit",
-    auto_close: bool = true => "auto-close" : bool,
-    daemon_timeout: u64 = 1800 => "daemon-timeout" : u64,
-    hide_changes_inactive: bool = false => "hide-changes-inactive" : bool,
-    hide_changes_active: bool = false => "hide-changes-active" : bool,
-    hide_changes_worktree: bool = false => "hide-changes-worktree" : bool,
-    hide_hints_footer: bool = false => "hide-hints-footer" : bool,
-    hide_hints_branches_active: bool = false => "hide-hints-branches-active" : bool,
-    hide_hints_branches_inactive: bool = false => "hide-hints-branches-inactive" : bool,
-    hide_hints_remotes_active: bool = false => "hide-hints-remotes-active" : bool,
-    hide_hints_remotes_inactive: bool = false => "hide-hints-remotes-inactive" : bool,
-    style_icon_daemon_loading: String = "─╲│╱".to_string() => "style-icon-daemon-loading" : string,
-    style_icon_daemon_ready: String = "✓".to_string() => "style-icon-daemon-ready" : string,
-    style_icon_active: String = "*".to_string() => "style-icon-active" : string,
-    style_icon_worktree: String = "⑂".to_string() => "style-icon-worktree" : string,
-    style_icon_agent_idle: String = "✓".to_string() => "style-icon-agent-idle" : string,
-    style_icon_agent_running: String = "⠋⠙⠹⠸⢰⣰⣠⣄⣆⡆⠇⠏".to_string() => "style-icon-agent-running" : string,
-    style_icon_input: String = "▸".to_string() => "style-icon-input" : string,
-    style_entries_gap: u64 = 0 => "style-entries-gap" : u64,
+    path                        : String = default_path(),
+    path_worktrees              : String = String::new(),
+    bind_jumpto                 : String = "enter".to_string(),
+    bind_command_mode           : char   = ':',
+    bind_help                   : char   = '?',
+    bind_command_session_kill   : String = "k".to_string(),
+    bind_command_worktree_new   : String = "n".to_string(),
+    bind_command_worktree_delete: String = "d".to_string(),
+    bind_quit                   : String = "esc,ctrl-c,ctrl-q".to_string(),
+    bind_nav_up                 : String = "up,ctrl-p".to_string(),
+    bind_nav_down               : String = "down,ctrl-n".to_string(),
+    bind_nav_page_up            : String = "ctrl-u".to_string(),
+    bind_nav_page_down          : String = "ctrl-d".to_string(),
+    bind_input_left             : String = "left".to_string(),
+    bind_input_right            : String = "right".to_string(),
+    bind_input_home             : String = "ctrl-a".to_string(),
+    bind_input_end              : String = "ctrl-e".to_string(),
+    bind_input_kill_line        : String = "ctrl-k".to_string(),
+    bind_input_delete_word      : String = "ctrl-w".to_string(),
+    bind_input_clear            : String = "ctrl-r".to_string(),
+    bind_input_word_left        : String = "alt-b".to_string(),
+    bind_input_word_right       : String = "alt-f".to_string(),
+    bind_input_backspace        : String = "backspace".to_string(),
+    bind_input_delete           : String = "delete".to_string(),
+    bind_command_exit           : String = "esc,backspace".to_string(),
+    bind_command_open_detached  : String = "o".to_string(),
+    bind_help_enter             : String = "enter".to_string(),
+    bind_help_exit              : String = "esc".to_string(),
+    auto_close                  : bool   = true,
+    daemon_timeout              : u64    = 1800,
+    hide_changes_inactive       : bool   = false,
+    hide_changes_active         : bool   = false,
+    hide_changes_worktree       : bool   = false,
+    hide_hints_footer           : bool   = false,
+    hide_hints_branches_active  : bool   = false,
+    hide_hints_branches_inactive: bool   = false,
+    hide_hints_remotes_active   : bool   = false,
+    hide_hints_remotes_inactive : bool   = false,
+    style_icon_daemon_loading   : String = "─╲│╱".to_string(),
+    style_icon_daemon_ready     : String = "✓".to_string(),
+    style_icon_active           : String = "*".to_string(),
+    style_icon_worktree         : String = "⑂".to_string(),
+    style_icon_agent_idle       : String = "✓".to_string(),
+    style_icon_agent_running    : String = "⠋⠙⠹⠸⢰⣰⣠⣄⣆⡆⠇⠏".to_string(),
+    style_icon_input            : String = "▸".to_string(),
+    style_entries_gap           : u64    = 0,
+    opencode_agents_ignored     : CSV    = Vec::new(),
 }
 
 impl Config {
@@ -213,7 +193,7 @@ impl Config {
             return false;
         };
         let new_trim = new_value.trim();
-        if key == "path" || key == "path-worktrees" {
+        if matches!(canonical_key(key).as_str(), "path" | "path_worktrees") {
             return util::expand_tilde(new_trim) == util::expand_tilde(&def_val);
         }
         def_val == new_trim
@@ -302,16 +282,16 @@ impl Config {
                         });
                     }
                 }
-                None => match key.as_str() {
-                    "auto-close"
-                    | "hide-changes-inactive"
-                    | "hide-changes-active"
-                    | "hide-changes-worktree"
-                    | "hide-hints-footer"
-                    | "hide-hints-branches-active"
-                    | "hide-hints-branches-inactive"
-                    | "hide-hints-remotes-active"
-                    | "hide-hints-remotes-inactive" => {
+                None => match canonical_key(key).as_str() {
+                    "auto_close"
+                    | "hide_changes_inactive"
+                    | "hide_changes_active"
+                    | "hide_changes_worktree"
+                    | "hide_hints_footer"
+                    | "hide_hints_branches_active"
+                    | "hide_hints_branches_inactive"
+                    | "hide_hints_remotes_active"
+                    | "hide_hints_remotes_inactive" => {
                         self.set_field(key, "true", &mut feedbacks);
                     }
                     _ => feedbacks.push(FeedbackEntry {
@@ -324,7 +304,6 @@ impl Config {
         feedbacks
     }
 
-    /// Check if a key event matches any of the comma-separated binds in `spec`.
     pub fn key_matches(spec: &str, key: KeyEvent) -> bool {
         for token in spec.split(',') {
             let t = token.trim();
@@ -399,7 +378,19 @@ fn token_matches(token: &str, key: KeyEvent) -> bool {
     }
 }
 
-fn parse_path(name: &str, value: &str) -> Result<(), String> {
+fn parse_string(value: &str) -> String {
+    value.to_string()
+}
+
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn parse_path_list(name: &str, value: &str) -> Result<String, String> {
     for raw in value.split(':') {
         if raw.is_empty() {
             continue;
@@ -413,7 +404,7 @@ fn parse_path(name: &str, value: &str) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(value.to_string())
 }
 
 fn parse_char(name: &str, value: &str) -> Result<char, String> {
@@ -448,39 +439,4 @@ fn parse_u64(name: &str, value: &str) -> Result<u64, String> {
             "'{name}' has invalid value {value:?} — expected a non-negative integer, falling back to default"
         )),
     }
-}
-
-fn push_err(fb: &mut Vec<FeedbackEntry>, msg: String) {
-    fb.push(FeedbackEntry {
-        level: FeedbackType::Error,
-        message: msg,
-    });
-}
-fn set_bool(slot: &mut bool, key: &str, value: &str, fb: &mut Vec<FeedbackEntry>) -> bool {
-    match parse_bool(key, value) {
-        Ok(v) => *slot = v,
-        Err(m) => push_err(fb, m),
-    }
-    true
-}
-fn set_u64(slot: &mut u64, key: &str, value: &str, fb: &mut Vec<FeedbackEntry>) -> bool {
-    match parse_u64(key, value) {
-        Ok(v) => *slot = v,
-        Err(m) => push_err(fb, m),
-    }
-    true
-}
-fn set_char(slot: &mut char, key: &str, value: &str, fb: &mut Vec<FeedbackEntry>) -> bool {
-    match parse_char(key, value) {
-        Ok(v) => *slot = v,
-        Err(m) => push_err(fb, m),
-    }
-    true
-}
-fn set_path(slot: &mut String, key: &str, value: &str, fb: &mut Vec<FeedbackEntry>) -> bool {
-    match parse_path(key, value) {
-        Ok(()) => *slot = value.to_string(),
-        Err(m) => push_err(fb, m),
-    }
-    true
 }

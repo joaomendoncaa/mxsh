@@ -106,6 +106,9 @@ style-icon-input = ▸
 # (the same count pads the input row, above and below)
 style-entries-gap = 0
 
+# comma-separated opencode agent names to ignore
+opencode-agents-ignored =
+
 # the daemon is thin when idle: with no picker connected it only does a
 # light keep-warm refresh every 30s (~0% CPU), so it can happily run at
 # login forever. it still self-destructs after this many idle seconds

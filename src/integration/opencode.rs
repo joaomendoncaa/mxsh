@@ -3,8 +3,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-static IGNORED_AGENTS: &[&str] = &["git-commit"];
-
 const PLUGIN_DIRNAME: &str = "ramo";
 const PLUGIN_ASSETS: &[(&str, &str)] = &[
     ("package.json", include_str!("assets/opencode/package.json")),
@@ -12,7 +10,7 @@ const PLUGIN_ASSETS: &[(&str, &str)] = &[
     ("tui.js", include_str!("assets/opencode/tui.js")),
 ];
 
-pub fn sessions() -> Option<Vec<Opencode>> {
+pub fn sessions(ignored_agents: &[String]) -> Option<Vec<Opencode>> {
     let arr = api("v2.session.list", &["--param", "limit=500"])?
         .get("data")?
         .as_array()?
@@ -24,11 +22,11 @@ pub fn sessions() -> Option<Vec<Opencode>> {
                 .map(|m| m.keys().cloned().collect())
         })
         .unwrap_or_default();
-    let out: Vec<Opencode> = arr
-        .iter()
-        .filter_map(|item| parse_session(item, &active))
-        .collect();
-    Some(out)
+    Some(
+        arr.iter()
+            .filter_map(|item| parse_session(item, &active, ignored_agents))
+            .collect(),
+    )
 }
 
 pub fn plugin_install() -> Result<(), String> {
@@ -39,23 +37,19 @@ pub fn plugin_install() -> Result<(), String> {
     plugin_register(&dir, &pkg)
 }
 
-fn run(args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("opencode2").args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(out.stdout)
-}
-
 fn api(method: &str, params: &[&str]) -> Option<serde_json::Value> {
     let mut args = vec!["api", method];
     args.extend(params);
-    let out = run(&args)?;
-    serde_json::from_slice(&out).ok()
+    let out = Command::new("opencode2").args(&args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
 }
 
 fn parse_session_timestamp(item: &serde_json::Value, key: &str) -> i64 {
-    item.pointer(&format!("/time/{key}"))
+    item.get("time")
+        .and_then(|t| t.get(key))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
 }
@@ -71,11 +65,15 @@ fn parse_session_title(item: &serde_json::Value) -> String {
     }
 }
 
-fn parse_session(item: &serde_json::Value, active: &HashSet<String>) -> Option<Opencode> {
+fn parse_session(
+    item: &serde_json::Value,
+    active: &HashSet<String>,
+    ignored_agents: &[String],
+) -> Option<Opencode> {
     if item
         .pointer("/agent")
         .and_then(|a| a.as_str())
-        .is_some_and(|a| IGNORED_AGENTS.contains(&a))
+        .is_some_and(|a| ignored_agents.iter().any(|x| x == a))
     {
         return None;
     }
@@ -109,9 +107,8 @@ fn plugin_config_dir() -> PathBuf {
 fn plugin_read_registered(
     path: &Path,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Err(_) => return Ok(serde_json::Map::new()),
-        Ok(s) => s,
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(serde_json::Map::new());
     };
 
     let value: serde_json::Value = serde_json::from_str(&text)

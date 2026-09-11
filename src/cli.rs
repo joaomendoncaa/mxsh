@@ -24,7 +24,6 @@ pub enum Command {
     Help,
     Config,
     Purge { with_config: bool },
-    SelfDestruct { with_config: bool },
     Unknown(String),
 }
 
@@ -71,20 +70,13 @@ impl Cli {
                     };
                 }
                 "purge" => command = Command::Purge { with_config: false },
-                "self-destruct" => command = Command::SelfDestruct { with_config: true },
                 "config" => command = Command::Config,
                 a if a.starts_with("--") => {
                     let rest = &a[2..];
-                    let is_purge = matches!(
-                        command,
-                        Command::Purge { .. } | Command::SelfDestruct { .. }
-                    );
+                    let is_purge = matches!(command, Command::Purge { .. });
                     if rest == "with-config" || rest.starts_with("with-config=") {
                         match &mut command {
                             Command::Purge { with_config } => {
-                                *with_config = true;
-                            }
-                            Command::SelfDestruct { with_config } => {
                                 *with_config = true;
                             }
                             _ => {

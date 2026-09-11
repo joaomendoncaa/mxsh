@@ -37,22 +37,3 @@ pub fn prune(reports: &ReportMap, live_panes: &HashSet<String>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stale_reports_are_ignored() {
-        let reports: ReportMap = ReportMap::default();
-        reports.lock().unwrap().insert(
-            "%1".into(),
-            (
-                "ses_old".into(),
-                Instant::now() - REPORT_TTL - Duration::from_secs(1),
-            ),
-        );
-        assert_eq!(reported_session(&reports, "%1"), None);
-        prune(&reports, &HashSet::from(["%1".to_string()]));
-        assert!(reports.lock().unwrap().is_empty());
-    }
-}

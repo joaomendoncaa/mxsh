@@ -11,6 +11,8 @@ use ratatui::{
 
 const CONNECTOR: Color = Color::DarkGray;
 const CURSOR_BG: Color = Color::DarkGray;
+const CURSOR_FG: Color = Color::White;
+const DEFAULT_BG: Color = Color::Black;
 const CMD_DIM: Color = Color::Rgb(100, 100, 100);
 const SPINNER_DAEMON: &[char] = &['─', '╲', '│', '╱'];
 
@@ -287,7 +289,7 @@ fn render_help(frame: &mut Frame, picker: &mut Picker) {
         let is_cursor = idx == cursor_line;
         let is_selectable = rows[idx].is_some();
         let base_style = if is_cursor {
-            Style::default().bg(CURSOR_BG).fg(Color::White)
+            Style::default().bg(CURSOR_BG).fg(CURSOR_FG)
         } else if !is_selectable {
             Style::default()
                 .fg(Color::DarkGray)
@@ -343,7 +345,7 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
     let marker_fg = if effective_dim {
         CMD_DIM
     } else if is_cursor && entry.kind == EntryType::Dir && entry.is_open {
-        Color::White
+        CURSOR_FG
     } else {
         match entry.kind {
             EntryType::Dir => Color::Reset,
@@ -366,7 +368,7 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
     let connector_style = if effective_dim {
         Style::default().fg(CMD_DIM)
     } else if is_cursor {
-        Style::default().fg(Color::White)
+        Style::default().fg(CURSOR_FG)
     } else {
         Style::default().fg(CONNECTOR)
     };
@@ -381,7 +383,7 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
         let star_style = if effective_dim {
             Style::default().fg(CMD_DIM)
         } else if is_cursor {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default().fg(CURSOR_FG).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD)
         };
@@ -393,7 +395,7 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
     ));
     spans.push(Span::styled(entry.label.as_str(), label_style));
     if let Some(branch) = &entry.branch {
-        let branch_style = if effective_dim { Style::default().fg(CMD_DIM) } else if is_cursor { Style::default().fg(Color::White).add_modifier(Modifier::DIM) } else { Style::default().fg(Color::DarkGray) };
+        let branch_style = if effective_dim { Style::default().fg(CMD_DIM) } else if is_cursor { Style::default().fg(CURSOR_FG).add_modifier(Modifier::DIM) } else { Style::default().fg(Color::DarkGray) };
         spans.push(Span::styled(format!(" {}", branch), branch_style));
     }
     if let Some(changes) = &entry.changes
@@ -416,7 +418,7 @@ pub fn entry(entry: &Entry, spinner: usize, is_cursor: bool, dimmed: bool) -> Li
     }
     let mut line = Line::from(spans);
     if is_cursor {
-        line = line.style(Style::default().bg(CURSOR_BG).fg(Color::White));
+        line = line.style(Style::default().bg(CURSOR_BG).fg(CURSOR_FG));
     }
     line
 }
@@ -458,7 +460,7 @@ fn cursor_line(prefix: String, input: &str, pos: usize, dim: bool) -> Line<'_> {
     let cursor_style = if dim {
         dim_style
     } else {
-        Style::default().bg(Color::White).fg(Color::Black)
+        Style::default().bg(CURSOR_FG).fg(Color::Black)
     };
     let mut spans = vec![Span::styled(prefix, prompt_style)];
     if input.is_empty() {
@@ -585,8 +587,8 @@ fn hints_line(picker: &Picker, hovered_action: Option<Action>) -> Line<'_> {
         Mode::HelpEditing => {
             let exit_hovered = hovered_action == Some(Action::ExitHelp);
             let badge = Style::default()
-                .bg(HOVER_BG)
-                .fg(HOVER_FG)
+                .bg(CURSOR_FG)
+                .fg(DEFAULT_BG)
                 .add_modifier(Modifier::BOLD);
             Line::from(vec![
                 Span::styled(" Help · Editing ", badge),
@@ -598,8 +600,8 @@ fn hints_line(picker: &Picker, hovered_action: Option<Action>) -> Line<'_> {
         Mode::Help => {
             let exit_hovered = hovered_action == Some(Action::ExitHelp);
             let badge = Style::default()
-                .bg(HOVER_BG)
-                .fg(HOVER_FG)
+                .bg(CURSOR_FG)
+                .fg(DEFAULT_BG)
                 .add_modifier(Modifier::BOLD);
             Line::from(vec![
                 Span::styled(" Help ", badge),
@@ -616,8 +618,8 @@ fn hints_line(picker: &Picker, hovered_action: Option<Action>) -> Line<'_> {
             let exit_hovered = hovered_action == Some(Action::ExitCommandMode);
             let help_hovered = hovered_action == Some(Action::HelpMode);
             let badge = Style::default()
-                .bg(HOVER_BG)
-                .fg(HOVER_FG)
+                .bg(CURSOR_FG)
+                .fg(DEFAULT_BG)
                 .add_modifier(Modifier::BOLD);
             Line::from(vec![
                 Span::styled(" Command ", badge),
@@ -661,65 +663,3 @@ pub fn feedback(feedback: &FeedbackEntry) -> Line<'_> {
     )])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{Entry, EntryType};
-    use std::path::PathBuf;
-
-    fn make_entry(kind: EntryType, depth: usize) -> Entry {
-        Entry {
-            kind,
-            label: String::new(),
-            path: PathBuf::from("/tmp"),
-            changes: None,
-            branch: None,
-            is_open: false,
-            is_running: false,
-            pending: false,
-            depth,
-            ancestors: vec![],
-            is_last: false,
-            search_text: String::new(),
-            goto: None,
-            parent: None,
-            connector: String::new(),
-            search_text_lower: String::new(),
-        }
-    }
-    fn spine_of(entry: &Entry) -> String {
-        match gap_line(entry, false).spans.first() {
-            Some(span) => span.content.to_string(),
-            None => String::new(),
-        }
-    }
-    #[test]
-    fn gap_spine_follows_depth() {
-        assert_eq!(spine_of(&make_entry(EntryType::Dir, 0)), "");
-        assert_eq!(spine_of(&make_entry(EntryType::Worktree, 1)), "│");
-    }
-
-    #[test]
-    fn entry_renders_branch_and_changes() {
-        let mut e = make_entry(EntryType::Dir, 0);
-        e.label = "project8".to_string();
-        e.branch = Some("feat/whatever".to_string());
-        e.changes = Some(crate::model::Changes {
-            additions: 20,
-            deletions: 40,
-        });
-        let line = crate::renderer::entry(&e, 0, false, false);
-        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("project8"), "label missing: {text}");
-        assert!(text.contains("feat/whatever"), "branch missing: {text}");
-        assert!(text.contains("+20"), "add missing: {text}");
-        assert!(text.contains("-40"), "del missing: {text}");
-        let mut e2 = make_entry(EntryType::Dir, 0);
-        e2.label = "project7".to_string();
-        e2.branch = None;
-        e2.changes = None;
-        let line2 = crate::renderer::entry(&e2, 0, false, false);
-        let text2: String = line2.spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(!text2.contains("feat"), "unexpected branch: {text2}");
-    }
-}

@@ -1,30 +1,9 @@
-mod builder;
-mod cli;
-mod clickable;
-mod config;
-mod daemon;
-mod events;
-mod filter;
-mod git;
-mod help;
-mod integration;
-mod logs;
-mod model;
-mod picker;
-mod purge;
-mod renderer;
-mod report;
-mod selfdestruct;
-mod service;
-mod terminal;
-mod tmux;
-mod util;
-
-use cli::{Cli, Command, Daemon, Plugin};
-use config::Config;
-use picker::Picker;
+use ramo::cli::{Cli, Command, Daemon, Plugin};
+use ramo::config::Config;
+use ramo::picker::{self, Picker};
+use ramo::terminal::Tui;
+use ramo::{daemon, integration, model, purge, service, tmux};
 use std::io;
-use terminal::Tui;
 
 fn main() -> io::Result<()> {
     let (mut config, mut feedbacks) = Config::new();
@@ -65,9 +44,6 @@ fn main() -> io::Result<()> {
         }
         Command::Purge { with_config } => {
             return purge::run(with_config);
-        }
-        Command::SelfDestruct { with_config } => {
-            return selfdestruct::run(with_config);
         }
         Command::Config => {
             daemon::print_config();
